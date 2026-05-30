@@ -5,6 +5,7 @@ members = [
     "crates/hid-input",
     "crates/vgamepad-output",
     "crates/platform-win",
+    "crates/kbm-output",
     "crates/engine",
     "crates/app",
 ]
@@ -18,7 +19,7 @@ authors = ["Vexon <noyvex@icloud.com>"]
 
 [workspace.dependencies]
 # pure-core deps
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 toml = "0.8"
 # core dev-deps
 approx = "0.5"

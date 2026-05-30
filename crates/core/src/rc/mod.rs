@@ -46,7 +46,7 @@ impl Default for RcMode {
 /// Per-stick RC configuration (one of these per LS / RS).
 ///
 /// Every field is `#[serde(default)]` so a partial TOML table fills in the C# `Reset()` defaults.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RcConfig {
     /// Whether the filter is active. When `false`, [`RcFilter::process`] is a pass-through.
     #[serde(default)]

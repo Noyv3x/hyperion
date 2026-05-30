@@ -21,6 +21,7 @@ crossbeam-channel = { workspace = true }
 hid-input = { path = "../hid-input" }
 vgamepad-output = { path = "../vgamepad-output" }
 platform-win = { path = "../platform-win" }
+kbm-output = { path = "../kbm-output" }
 
 [lints]
 workspace = true

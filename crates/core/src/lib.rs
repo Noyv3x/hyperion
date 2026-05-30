@@ -19,9 +19,11 @@ pub mod config;
 pub mod convert;
 pub mod dt;
 pub mod input;
+pub mod map;
 pub mod output;
 pub mod rc;
 pub mod stick;
+pub mod trigger;
 
 pub use axis::{clamp_axis, Axis, RawStickFormat};
 pub use dt::{Dt, DT_MAX_US, DT_MIN_US};

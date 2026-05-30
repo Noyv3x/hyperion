@@ -120,7 +120,12 @@ impl Runtime {
         cfg: EngineConfig,
         cfg_path: Option<std::path::PathBuf>,
     ) -> Result<Runtime, EngineError> {
-        let (config, (_telemetry_tx, telemetry_rx), _commands) = crate::handoff::build_links(cfg);
+        // The KBM egress ring is built cross-platform (it is pure `rtrb<KbmBatch>`); on non-Windows
+        // there is no injector thread to drain it, so both ends are dropped immediately here. The
+        // hot thread + injector are Windows-only (this `Runtime` is a control-plane-only build off
+        // Windows, kept so the cross-platform pieces stay unit-testable on Linux CI).
+        let (config, (_telemetry_tx, telemetry_rx), _commands, _kbm) =
+            crate::handoff::build_links(cfg);
         let store = ConfigStore::from_handle(config.clone()).with_path(cfg_path);
 
         let (control_tx, control_rx) = crossbeam_channel::bounded(CONTROL_QUEUE_CAP);
@@ -209,45 +214,61 @@ fn spawn_control_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::Stick;
-    use hyperion_core::config::{DeviceConfig, StickMode};
+    use hyperion_core::input::Control;
+    use hyperion_core::map::{BindTarget, PadBtn, Profile};
 
-    /// A config with one device so control edits have a target.
-    fn cfg_with_device() -> EngineConfig {
+    /// A config with one device assigned to a `"default"` profile so control edits have a target.
+    fn cfg_with_profile() -> EngineConfig {
         let mut cfg = EngineConfig {
             active_device: "dev".to_string(),
             ..EngineConfig::default()
         };
-        cfg.devices
-            .insert("dev".to_string(), DeviceConfig::default());
+        std::sync::Arc::make_mut(&mut cfg.profiles).insert(
+            "default".to_string(),
+            Profile {
+                name: "default".to_string(),
+                ..Profile::default()
+            },
+        );
+        cfg.assignments
+            .insert("dev".to_string(), "default".to_string());
         cfg
     }
 
     #[test]
     fn start_then_edit_is_observed_in_the_snapshot() {
-        let mut rt = Runtime::start(cfg_with_device(), None).expect("runtime starts");
+        let mut rt = Runtime::start(cfg_with_profile(), None).expect("runtime starts");
 
-        // Seed value from the snapshot.
-        assert_eq!(rt.config_snapshot().devices["dev"].ls.mode, StickMode::None);
+        // Seed value from the snapshot: Cross is unbound (identity passthrough).
+        assert!(!rt.config_snapshot().profiles["default"]
+            .bindings
+            .contains_key(&Control::Cross));
 
-        // The GUI sends an edit through a cloned sender; the writer thread applies it.
+        // The GUI sends a binding edit through a cloned sender; the writer thread applies it.
         let tx = rt.control_sender();
-        tx.send(ControlMsg::SetStickMode {
-            device: "dev".to_string(),
-            stick: Stick::Left,
-            mode: StickMode::Rc,
+        tx.send(ControlMsg::SetBinding {
+            profile: "default".to_string(),
+            control: Control::Cross,
+            bind: BindTarget::GamepadButton(PadBtn::B),
         })
         .expect("send to the control-writer thread");
 
-        // Poll the wait-free snapshot until the single writer publishes the new generation.
+        // Poll the wait-free snapshot until the single writer thread applies + publishes. Sleep
+        // (not `yield_now`) between polls: `yield_now` is only a hint and need not schedule the
+        // freshly-spawned writer, so a busy spin can starve it; a short sleep reliably hands off.
         let mut observed = None;
-        for _ in 0..1000 {
+        for _ in 0..200 {
             let snap = rt.config_snapshot();
-            if snap.devices["dev"].ls.mode == StickMode::Rc {
+            if snap.profiles["default"]
+                .bindings
+                .get(&Control::Cross)
+                .map(|s| s.bind)
+                == Some(BindTarget::GamepadButton(PadBtn::B))
+            {
                 observed = Some(());
                 break;
             }
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert!(observed.is_some(), "edit must reach the published snapshot");
 
@@ -260,7 +281,7 @@ mod tests {
 
     #[test]
     fn shutdown_joins_cleanly_with_outstanding_sender() {
-        let rt = Runtime::start(cfg_with_device(), None).expect("runtime starts");
+        let rt = Runtime::start(cfg_with_profile(), None).expect("runtime starts");
         // Keep a GUI sender clone alive across shutdown: the dedicated stop signal must still
         // unblock and join the writer thread (it does not rely on channel disconnect).
         let _alive = rt.control_sender();

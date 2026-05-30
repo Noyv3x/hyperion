@@ -2,25 +2,29 @@
 //! traits ([`crate::hot::DeviceSource`] / [`crate::hot::VirtualPad`]).
 //!
 //! The hot loop is written generically over two engine-owned traits expressed in
-//! [`hyperion_core`] value types ([`HotInput`] / [`OutputFrame`]). The concrete backends speak
-//! their own vocabulary:
+//! [`hyperion_core`] value types ([`HotInput`] in / [`OutputState`] out). The concrete backends
+//! speak their own vocabulary:
 //!
 //! * `hid-input`'s [`hid_input::DeviceSource`] fills an [`InputSample`] in place
 //!   (`next_sample(&mut InputSample) -> Result<bool, _>`),
 //! * `vgamepad-output`'s [`vgamepad_output::VirtualPad`] is a lifecycle trait
-//!   (`plugin` / `wait_ready` / `update` / `unplug`).
+//!   (`plugin` / `wait_ready` / `update(&OutputFrame)` / `unplug`).
 //!
 //! These adapters own one concrete backend each and implement the engine trait, doing the
-//! per-report `InputSample → HotInput` translation (including the DS→Xbox-360 button map, the
-//! one mapping core does not own because core carries the raw DS button bytes opaquely) and the
-//! lifecycle wiring (HidHide cloak, ViGEm plug/wait). Everything here is `cfg(windows)` — the
-//! whole module is only compiled in via the Windows-gated `supervisor`/`hot` modules.
+//! per-report `InputSample → HotInput` translation (carrying the raw DS button word for the
+//! mapping engine's structured decode, plus the DS→`PadButtons` decode lowered via the core
+//! `pack_xinput` for the all-passthrough fast path), the `OutputState → OutputFrame` projection
+//! into the X360 backend (the single i16 round stays in `vgamepad-output`), the KBM injector
+//! thread (drains the egress ring → `SendInput`), and the lifecycle wiring (HidHide cloak, ViGEm
+//! plug/wait). Everything here is `cfg(windows)` — the whole module is only compiled in via the
+//! Windows-gated `supervisor`/`hot` modules.
 
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use hyperion_core::config::{EngineConfig, WaitMode as CfgWaitMode};
 use hyperion_core::input::{InputSample, SourceMeta};
-use hyperion_core::output::OutputFrame;
+use hyperion_core::output::OutputState;
 use hyperion_core::stick::StickSample;
 
 use hid_input::win::hid::WaitMode as HidWaitMode;
@@ -29,7 +33,12 @@ use platform_win::hidhide::{HidHide, HidHideBackend};
 use platform_win::sched::{HotThreadConfig, WaitMode as SchedWaitMode};
 use vgamepad_output::{OutErr, Vigem360Pad, VirtualPad as VgVirtualPad};
 
+use crate::handoff::KbmRx;
 use crate::hot::{DeviceSource, HotInput, VirtualPad};
+
+/// How long the KBM injector sleeps between drains when the ring is empty (no busy-spin off the
+/// hot thread). Short enough that key edges feel immediate, long enough to idle near-zero CPU.
+const KBM_IDLE_POLL: Duration = Duration::from_millis(1);
 
 /// How long to wait for the OS to enumerate the freshly-plugged virtual pad before giving up.
 const VIGEM_READY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -117,6 +126,8 @@ impl DualSenseDevice {
             pid: id.pid,
             name: "DualSense (USB)",
             stick_bits: 8,
+            // DualSense Edge (PID 0x0DF2) exposes the Fn/paddle superset; gate its decode.
+            is_edge: id.pid == 0x0DF2,
         };
         let source = DualSenseUsbSource::open(id, hid_wait_mode(cfg), meta)
             .map_err(log_source_err)
@@ -158,10 +169,12 @@ impl DeviceSource for DualSenseDevice {
 
 /// Convert a decoded [`InputSample`] into the engine's [`HotInput`].
 ///
-/// Sticks/triggers are already canonical (`[-1,1]` / `[0,1]`) in core units; this only re-homes
-/// them into the engine value type and maps the opaque DS button bytes into the Xbox-360
-/// bitfield. `dt_us` / `dropped` / `is_duplicate` / `host_qpc_ns` are carried through verbatim
-/// (the backend already folded dt via the `SensorClock` and derived drop/dupe via `SeqTracker`).
+/// Sticks/triggers are already canonical (`[-1,1]` / `[0,1]`) in core units; this re-homes them
+/// into the engine value type, packs the opaque DS button bytes into the Xbox-360 bitfield for
+/// the all-passthrough fast path, **and carries the raw DS button word through verbatim**
+/// (`raw_buttons = s.buttons.0`, blueprint §9) so the mapping engine's `ControllerState` decode
+/// reads the structured buttons with zero new device-side decode. `dt_us` / `dropped` /
+/// `is_duplicate` / `host_qpc_ns` carry through (the backend already folded them).
 #[inline]
 fn hot_input_from_sample(s: &InputSample, is_prime: bool) -> HotInput {
     HotInput {
@@ -169,7 +182,10 @@ fn hot_input_from_sample(s: &InputSample, is_prime: bool) -> HotInput {
         right: StickSample::new(s.right.x, s.right.y),
         lt: s.l2,
         rt: s.r2,
-        buttons: ds_buttons_to_xinput(s.buttons.0),
+        // The fast-path XInput word is the structured DS→PadButtons decode lowered via the core
+        // `pack_xinput` (the single source of truth for the PadButtons→XInput bit layout, §9).
+        buttons: hyperion_core::output::pack_xinput(ds_buttons_to_pad(s.buttons.0)),
+        raw_buttons: s.buttons.0,
         dt_us: s.dt_us,
         is_prime,
         dropped: s.dropped,
@@ -178,44 +194,29 @@ fn hot_input_from_sample(s: &InputSample, is_prime: bool) -> HotInput {
     }
 }
 
-// XInput (`XINPUT_GAMEPAD_*`) button bits.
-const XI_DPAD_UP: u16 = 0x0001;
-const XI_DPAD_DOWN: u16 = 0x0002;
-const XI_DPAD_LEFT: u16 = 0x0004;
-const XI_DPAD_RIGHT: u16 = 0x0008;
-const XI_START: u16 = 0x0010;
-const XI_BACK: u16 = 0x0020;
-const XI_LTHUMB: u16 = 0x0040;
-const XI_RTHUMB: u16 = 0x0080;
-const XI_LSHOULDER: u16 = 0x0100;
-const XI_RSHOULDER: u16 = 0x0200;
-const XI_GUIDE: u16 = 0x0400;
-const XI_A: u16 = 0x1000;
-const XI_B: u16 = 0x2000;
-const XI_X: u16 = 0x4000;
-const XI_Y: u16 = 0x8000;
-
-/// Map the three raw DualSense button bytes (packed `btn0|btn1<<8|btn2<<16` by the HID
-/// backend) into the XInput button bitfield consumed by the virtual Xbox-360 pad.
+/// Decode the three raw DualSense button bytes (packed `btn0|btn1<<8|btn2<<16` by the HID
+/// backend) into the structured [`PadButtons`](hyperion_core::output::PadButtons) set.
 ///
-/// Layout follows the DS4Windows / `DS4Device.cs` ground truth:
+/// This is the device-specific half (raw DS bytes → target-agnostic buttons); the
+/// target-agnostic half (`PadButtons` → XInput / DS4 wire bits) lives in core
+/// ([`pack_xinput`](hyperion_core::output::pack_xinput) / the DS4 lowering), so there is exactly
+/// one button-bit-layout authority shared with the mapping engine and the DS4 backend.
+///
+/// Layout follows the DS4Windows / `DS4Device.cs` ground truth (mirrors core's
+/// `decode_controller_state` button map, blueprint §3.5):
 /// * `btn0` (byte 5): low nibble = D-pad hat (`0..7`, `8` = released); high nibble = face
 ///   buttons Square `0x10` / Cross `0x20` / Circle `0x40` / Triangle `0x80`.
 /// * `btn1` (byte 6): L1 `0x01`, R1 `0x02`, L2-click `0x04`, R2-click `0x08`, Share `0x10`,
 ///   Options `0x20`, L3 `0x40`, R3 `0x80`.
-/// * `btn2` (byte 7): PS `0x01`, Touchpad-click `0x02` (upper 6 bits are the frame counter,
-///   already consumed by the core seq tracker).
-///
-/// Face-button mapping uses the standard cross-layout (Cross→A, Circle→B, Square→X, Triangle→Y).
-// HW-verify: the DS button bit positions and the hat-to-DPAD decode are HW-verify in core's
-// `ds_report` byte map; this mapping mirrors that ground truth but is validated on hardware.
+/// * `btn2` (byte 7): PS `0x01`, Touchpad-click `0x02` (upper bits are the frame counter).
 #[inline]
-fn ds_buttons_to_xinput(raw: u32) -> u16 {
+fn ds_buttons_to_pad(raw: u32) -> hyperion_core::output::PadButtons {
+    use hyperion_core::output::PadButtons as P;
     let btn0 = (raw & 0xFF) as u8;
     let btn1 = ((raw >> 8) & 0xFF) as u8;
     let btn2 = ((raw >> 16) & 0xFF) as u8;
 
-    let mut out: u16 = 0;
+    let mut out = P::default();
 
     // D-pad hat (low nibble of btn0): 0=N,1=NE,2=E,3=SE,4=S,5=SW,6=W,7=NW, 8=released.
     let hat = btn0 & 0x0F;
@@ -230,57 +231,27 @@ fn ds_buttons_to_xinput(raw: u32) -> u16 {
         7 => (true, false, false, true),
         _ => (false, false, false, false),
     };
-    if up {
-        out |= XI_DPAD_UP;
-    }
-    if down {
-        out |= XI_DPAD_DOWN;
-    }
-    if left {
-        out |= XI_DPAD_LEFT;
-    }
-    if right {
-        out |= XI_DPAD_RIGHT;
-    }
+    out.set(P::DPAD_UP, up);
+    out.set(P::DPAD_DOWN, down);
+    out.set(P::DPAD_LEFT, left);
+    out.set(P::DPAD_RIGHT, right);
 
     // Face buttons (high nibble of btn0), cross layout.
-    if btn0 & 0x10 != 0 {
-        out |= XI_X; // Square
-    }
-    if btn0 & 0x20 != 0 {
-        out |= XI_A; // Cross
-    }
-    if btn0 & 0x40 != 0 {
-        out |= XI_B; // Circle
-    }
-    if btn0 & 0x80 != 0 {
-        out |= XI_Y; // Triangle
-    }
+    out.set(P::X, btn0 & 0x10 != 0); // Square
+    out.set(P::A, btn0 & 0x20 != 0); // Cross
+    out.set(P::B, btn0 & 0x40 != 0); // Circle
+    out.set(P::Y, btn0 & 0x80 != 0); // Triangle
 
     // Shoulders / stick clicks / meta (btn1).
-    if btn1 & 0x01 != 0 {
-        out |= XI_LSHOULDER; // L1
-    }
-    if btn1 & 0x02 != 0 {
-        out |= XI_RSHOULDER; // R1
-    }
-    if btn1 & 0x10 != 0 {
-        out |= XI_BACK; // Share -> Back/View
-    }
-    if btn1 & 0x20 != 0 {
-        out |= XI_START; // Options -> Start/Menu
-    }
-    if btn1 & 0x40 != 0 {
-        out |= XI_LTHUMB; // L3
-    }
-    if btn1 & 0x80 != 0 {
-        out |= XI_RTHUMB; // R3
-    }
+    out.set(P::LB, btn1 & 0x01 != 0); // L1
+    out.set(P::RB, btn1 & 0x02 != 0); // R1
+    out.set(P::BACK, btn1 & 0x10 != 0); // Share -> Back/View
+    out.set(P::START, btn1 & 0x20 != 0); // Options -> Start/Menu
+    out.set(P::LS, btn1 & 0x40 != 0); // L3
+    out.set(P::RS, btn1 & 0x80 != 0); // R3
 
     // PS button -> Guide (btn2).
-    if btn2 & 0x01 != 0 {
-        out |= XI_GUIDE;
-    }
+    out.set(P::GUIDE, btn2 & 0x01 != 0);
 
     out
 }
@@ -311,14 +282,131 @@ impl Vigem360Target {
 impl VirtualPad for Vigem360Target {
     type Error = OutErr;
 
+    /// Project the structured [`OutputState`] to the X360 [`OutputFrame`] and submit it. The
+    /// single i16/u8 round still happens in the `vgamepad-output` backend via `to_xinput_*`
+    /// (M3 keeps the X360 `OutputFrame` egress; the `OutputState`-native DS4 path lands in M5,
+    /// blueprint §6.3). `OutputState::to_output_frame` only packs the button word + copies the
+    /// f64 sticks/triggers, so the no-mid-chain-quantization invariant is intact.
     #[inline]
-    fn update(&mut self, frame: &OutputFrame) -> Result<(), Self::Error> {
-        self.pad.update(frame)
+    fn update(&mut self, state: &OutputState) -> Result<(), Self::Error> {
+        self.pad.update(&state.to_output_frame())
     }
+}
+
+/// Spawn the **KBM injector** thread (blueprint §7.3): a normal-priority worker that drains the
+/// hot loop's [`KbmRx`] egress ring and realizes each [`KbmBatch`](hyperion_core::output::KbmBatch)
+/// via one batched `SendInput`. Macro playback timing (the unbounded part) lives here, never on
+/// the hot thread.
+///
+/// The thread exits cleanly when the producer (the hot thread's `KbmTx`) is dropped and the ring
+/// is drained ([`KbmRx::is_abandoned`]); on shutdown it releases any keys it is holding so a
+/// crash/stop never leaves a key stuck down. Idle drains sleep [`KBM_IDLE_POLL`] (no busy-spin).
+///
+/// The Win32 `SendInput` body lives in the `kbm-output` crate's `SendInputKbm` (`KbmSink`); this
+/// is the only place the engine touches it, and it is `cfg(windows)` so the pure-core Linux CI is
+/// unaffected.
+pub(crate) fn spawn_kbm_injector(mut kbm_rx: KbmRx) -> std::io::Result<JoinHandle<()>> {
+    use kbm_output::{KbmSink, SendInputKbm};
+
+    std::thread::Builder::new()
+        .name("hyperion-kbm-injector".to_string())
+        .spawn(move || {
+            let mut sink = SendInputKbm::new();
+            loop {
+                // Drain everything currently queued, flushing each batch in one SendInput.
+                let mut drained_any = false;
+                while let Some(batch) = kbm_rx.pop() {
+                    drained_any = true;
+                    if let Err(e) = sink.flush(&batch) {
+                        log_kbm_err(&e);
+                    }
+                }
+                // Producer gone and ring drained: release held keys and exit cleanly.
+                if kbm_rx.is_abandoned() {
+                    let _ = sink.release_all();
+                    return;
+                }
+                // Idle: sleep briefly so the thread is near-zero CPU when nothing is queued.
+                if !drained_any {
+                    std::thread::sleep(KBM_IDLE_POLL);
+                }
+            }
+        })
+}
+
+/// Surface a KBM injection error to stderr (cold path only — a `SendInput` failure is rare and
+/// non-fatal; the next report's edges retry).
+fn log_kbm_err<E: std::fmt::Display>(e: &E) {
+    eprintln!("hyperion: KBM injection failed: {e}");
 }
 
 /// Surface an [`OutErr`] to stderr (cold setup path only — plug / wait_ready, never the hot
 /// loop). Returned from `map_err` so the caller can `.ok()?` the result.
 fn log_out_err(e: OutErr) {
     eprintln!("hyperion: virtual pad setup failed: {e}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperion_core::output::{pack_xinput, PadButtons};
+
+    // XInput button bits, for asserting the fast-path word matches the former ds_buttons_to_xinput.
+    const XI_DPAD_UP: u16 = 0x0001;
+    const XI_BACK: u16 = 0x0020;
+    const XI_LTHUMB: u16 = 0x0040;
+    const XI_LSHOULDER: u16 = 0x0100;
+    const XI_GUIDE: u16 = 0x0400;
+    const XI_A: u16 = 0x1000;
+    const XI_X: u16 = 0x4000;
+
+    #[test]
+    fn ds_buttons_to_pad_decodes_face_and_meta() {
+        // btn0: hat=8 (neutral) + Cross (0x20); btn1: L1 (0x01); btn2: PS (0x01).
+        let raw = 0x28u32 | (0x01u32 << 8) | (0x01u32 << 16);
+        let pad = ds_buttons_to_pad(raw);
+        assert!(pad.has(PadButtons::A), "Cross -> A");
+        assert!(pad.has(PadButtons::LB), "L1 -> LB");
+        assert!(pad.has(PadButtons::GUIDE), "PS -> Guide");
+        assert!(!pad.has(PadButtons::B));
+        // Lowered to XInput, matches the legacy ds_buttons_to_xinput output.
+        assert_eq!(pack_xinput(pad), XI_A | XI_LSHOULDER | XI_GUIDE);
+    }
+
+    #[test]
+    fn ds_buttons_to_pad_decodes_dpad_hat() {
+        // hat=0 -> North (up only).
+        let pad = ds_buttons_to_pad(0x00);
+        assert!(pad.has(PadButtons::DPAD_UP));
+        assert!(!pad.has(PadButtons::DPAD_DOWN));
+        assert_eq!(pack_xinput(pad) & XI_DPAD_UP, XI_DPAD_UP);
+        // hat=8 -> neutral (no dpad).
+        let neutral = ds_buttons_to_pad(0x08);
+        assert!(!neutral.has(PadButtons::DPAD_UP));
+    }
+
+    #[test]
+    fn ds_buttons_to_pad_share_options_and_thumbs() {
+        // btn1: Share (0x10) + L3 (0x40); btn0: Square (0x10) + hat neutral (0x08).
+        let raw = (0x18u32) | ((0x10u32 | 0x40u32) << 8);
+        let pad = ds_buttons_to_pad(raw);
+        assert!(pad.has(PadButtons::X), "Square -> X");
+        assert!(pad.has(PadButtons::BACK), "Share -> Back");
+        assert!(pad.has(PadButtons::LS), "L3 -> LS");
+        assert_eq!(pack_xinput(pad), XI_X | XI_BACK | XI_LTHUMB);
+    }
+
+    #[test]
+    fn hot_input_carries_raw_buttons_and_packed_word() {
+        let s = InputSample {
+            buttons: hyperion_core::input::Buttons(0x20 | 0x08), // Cross + neutral hat
+            ..InputSample::default()
+        };
+        let hi = hot_input_from_sample(&s, false);
+        assert_eq!(hi.raw_buttons, 0x20 | 0x08, "raw DS word carried through");
+        assert_eq!(
+            hi.buttons, XI_A,
+            "fast-path XInput word packed from PadButtons"
+        );
+    }
 }

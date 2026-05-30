@@ -1,9 +1,29 @@
-//! The pluggable stick-processing contract.
+//! The pluggable stick-processing contract and the full DS4Windows-class stick pipeline.
 //!
 //! A [`StickAlgorithm`] is a pure function of `(sample, dt, config, &mut state)` — no clock,
 //! no allocation, no interior mutability, no I/O — so experimental algorithms drop in behind
 //! one interface and are trivially testable. The engine owns the per-stick `State` and feeds
 //! the guarded real elapsed time each report.
+//!
+//! On top of that primitive contract this module hosts the full ordered stick chain ported
+//! from DS4Windows' `SetCurveAndDeadzone`:
+//!
+//! * [`settings`] — [`StickSettings`](settings::StickSettings) and the per-stage parameter
+//!   structs (deadzone, anti-snapback, fuzz, rotation, square-stick, output curve, flick),
+//!   plus the resident per-stick [`StickState`](settings::StickState).
+//! * [`stages`] — the pure per-stage helpers in the DS4 `[0,255]` f64 domain.
+//! * [`pipeline`] — [`process_stick`](pipeline::process_stick), the fixed-order chain that
+//!   reuses the existing bit-exact [`RcFilter`](crate::rc::RcFilter) as stage 0.
+
+pub mod pipeline;
+pub mod settings;
+pub mod stages;
+
+pub use pipeline::process_stick;
+pub use settings::{
+    AntiSnapback, DeadZoneType, FlickStick, OutputCurve, RotationSettings, SnapbackRing,
+    SquareStick, StickDeadZone, StickSettings, StickState, SNAP_CAP,
+};
 
 use crate::axis::Axis;
 use crate::dt::Dt;

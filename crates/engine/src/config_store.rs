@@ -21,8 +21,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hyperion_core::config::{load_toml, to_toml, EngineConfig};
+use hyperion_core::map::{BindingSlot, Profile};
 
-use crate::control::{ControlMsg, Stick};
+use crate::control::{ControlMsg, Stick, Trigger};
 use crate::handoff::ConfigHandle;
 
 /// A monotonically increasing config version. The hot loop caches the last value it applied
@@ -189,41 +190,198 @@ impl ConfigStore {
     }
 }
 
-/// Apply a non-disk [`ControlMsg`] to a mutable snapshot clone. Unknown devices are silently
-/// skipped (the caller's no-change check then returns `false`).
+/// Apply a non-disk [`ControlMsg`] to a mutable snapshot clone. Unknown devices / profiles are
+/// silently skipped (the caller's no-change TOML compare then returns `false`), identical to the
+/// M2 behavior for an absent device.
+///
+/// All profile edits mutate `cfg.profiles` through [`Arc::make_mut`] (blueprint §7.1 keeps
+/// `profiles` an `Arc<BTreeMap>` so a per-generation `EngineConfig::clone` is a refcount bump,
+/// not a deep tree copy — the cost is paid once, here, on the cold config-writer thread).
 fn edit_in_place(cfg: &mut EngineConfig, msg: &ControlMsg) {
     match msg {
+        // ---- Global / device-level (unchanged topology) ----
+        ControlMsg::SetThread(thread) => cfg.thread = thread.clone(),
+        ControlMsg::SetHidHide(hidhide) => cfg.hidhide = hidhide.clone(),
+        ControlMsg::SetActiveDevice(id) => cfg.active_device = id.clone(),
+
+        // ---- Stick mode / RC now target the device's assigned profile (§9) ----
         ControlMsg::SetStickMode {
             device,
             stick,
             mode,
         } => {
-            if let Some(dev) = cfg.devices.get_mut(device) {
-                stick_mut(dev, *stick).mode = *mode;
+            if let Some(p) = profile_for_device_mut(cfg, device) {
+                // `Rc` selects the RC stage; any other mode turns it off (blueprint §9 shim).
+                stick_settings_mut(p, *stick).rc_mode_on =
+                    *mode == hyperion_core::config::StickMode::Rc;
             }
         }
         ControlMsg::SetRc { device, stick, rc } => {
-            if let Some(dev) = cfg.devices.get_mut(device) {
-                stick_mut(dev, *stick).rc = *rc;
+            if let Some(p) = profile_for_device_mut(cfg, device) {
+                stick_settings_mut(p, *stick).rc = *rc;
             }
         }
-        ControlMsg::SetThread(thread) => cfg.thread = thread.clone(),
-        ControlMsg::SetHidHide(hidhide) => cfg.hidhide = hidhide.clone(),
-        ControlMsg::SetActiveDevice(id) => cfg.active_device = id.clone(),
+
+        // ---- Profile lifecycle ----
+        // `SetActiveProfile`/`SetAssignment` both assign `device -> profile`; assign only a
+        // profile that exists (an unknown id stays a silent no-op → `false`).
+        ControlMsg::SetActiveProfile {
+            device,
+            name: profile,
+        }
+        | ControlMsg::SetAssignment { device, profile } => {
+            if cfg.profiles.contains_key(profile) {
+                cfg.assignments.insert(device.clone(), profile.clone());
+            }
+        }
+        ControlMsg::CreateProfile { name } => {
+            let profiles = Arc::make_mut(&mut cfg.profiles);
+            profiles.entry(name.clone()).or_insert_with(|| Profile {
+                name: name.clone(),
+                ..Profile::default()
+            });
+        }
+        ControlMsg::DuplicateProfile { src, dst } => {
+            // Only if `src` exists and `dst` is free.
+            if let Some(src_profile) = cfg.profiles.get(src).cloned() {
+                let profiles = Arc::make_mut(&mut cfg.profiles);
+                if !profiles.contains_key(dst) {
+                    let mut copy = src_profile;
+                    copy.name = dst.clone();
+                    profiles.insert(dst.clone(), copy);
+                }
+            }
+        }
+        ControlMsg::RenameProfile { from, to } => {
+            // Only if `from` exists and `to` is free.
+            if cfg.profiles.contains_key(from) && !cfg.profiles.contains_key(to) {
+                let profiles = Arc::make_mut(&mut cfg.profiles);
+                if let Some(mut p) = profiles.remove(from) {
+                    p.name = to.clone();
+                    profiles.insert(to.clone(), p);
+                }
+                // Re-point any assignment that referenced the old id.
+                for assigned in cfg.assignments.values_mut() {
+                    if assigned == from {
+                        *assigned = to.clone();
+                    }
+                }
+            }
+        }
+        ControlMsg::DeleteProfile { name } => {
+            if cfg.profiles.contains_key(name) {
+                Arc::make_mut(&mut cfg.profiles).remove(name);
+                // Drop any assignment that pointed at the deleted profile.
+                cfg.assignments.retain(|_, pid| pid != name);
+            }
+        }
+        ControlMsg::SetOutputKind { profile, kind } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                p.output_kind = *kind;
+            }
+        }
+
+        // ---- Bindings ----
+        ControlMsg::SetBinding {
+            profile,
+            control,
+            bind,
+        } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                p.bindings
+                    .entry(*control)
+                    .or_insert_with(BindingSlot::default)
+                    .bind = *bind;
+            }
+        }
+        ControlMsg::ClearBinding { profile, control } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                p.bindings.remove(control);
+            }
+        }
+        ControlMsg::SetShiftTrigger {
+            profile,
+            control,
+            trigger,
+            bind,
+        } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                let slot = p
+                    .bindings
+                    .entry(*control)
+                    .or_insert_with(BindingSlot::default);
+                slot.shift_trigger = *trigger;
+                slot.shift_bind = *bind;
+            }
+        }
+
+        // ---- Stick / trigger settings ----
+        ControlMsg::SetStickSettings {
+            profile,
+            stick,
+            settings,
+        } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                *stick_settings_mut(p, *stick) = *settings;
+            }
+        }
+        ControlMsg::SetTriggerSettings {
+            profile,
+            trigger,
+            settings,
+        } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                match trigger {
+                    Trigger::Left => p.l2 = *settings,
+                    Trigger::Right => p.r2 = *settings,
+                }
+            }
+        }
+
+        // ---- M4/M5 surface: accepted-but-no-op in M3 ----
+        // The variants exist so the GUI / writer compile against the full message surface; their
+        // config-tree mutation (macros, special actions) and the hot-loop consumers land in
+        // M4/M5. Accepting them as no-ops keeps the single-writer contract uniform.
+        ControlMsg::UpsertMacro { .. }
+        | ControlMsg::DeleteMacro { .. }
+        | ControlMsg::UpsertSpecialAction { .. }
+        | ControlMsg::DeleteSpecialAction { .. }
+        | ControlMsg::SetAutoSwitchEnabled(_) => { /* TODO(M4/M5): mutate macros/specials/auto-switch */
+        }
+
         // Disk messages are handled before this function is reached.
         ControlMsg::SaveToDisk | ControlMsg::ReloadFromDisk => {}
     }
 }
 
-/// Mutable borrow of the selected stick's [`StickConfig`](hyperion_core::config::StickConfig).
+/// Mutable borrow of the profile assigned to `device` (via `EngineConfig::assignments`), through
+/// [`Arc::make_mut`]. `None` if the device has no assignment or the assigned profile is absent.
 #[inline]
-fn stick_mut(
-    dev: &mut hyperion_core::config::DeviceConfig,
+fn profile_for_device_mut<'a>(cfg: &'a mut EngineConfig, device: &str) -> Option<&'a mut Profile> {
+    let pid = cfg.assignments.get(device)?.clone();
+    profile_mut(cfg, &pid)
+}
+
+/// Mutable borrow of the profile `id` through [`Arc::make_mut`]. `None` if the id is absent.
+#[inline]
+fn profile_mut<'a>(cfg: &'a mut EngineConfig, id: &str) -> Option<&'a mut Profile> {
+    // Avoid the make_mut clone when the id is absent (keeps an unknown-id edit a true no-op).
+    if !cfg.profiles.contains_key(id) {
+        return None;
+    }
+    Arc::make_mut(&mut cfg.profiles).get_mut(id)
+}
+
+/// Mutable borrow of the selected stick's [`StickSettings`](hyperion_core::stick::settings::StickSettings)
+/// inside a profile.
+#[inline]
+fn stick_settings_mut(
+    p: &mut Profile,
     stick: Stick,
-) -> &mut hyperion_core::config::StickConfig {
+) -> &mut hyperion_core::stick::settings::StickSettings {
     match stick {
-        Stick::Left => &mut dev.ls,
-        Stick::Right => &mut dev.rs,
+        Stick::Left => &mut p.ls,
+        Stick::Right => &mut p.rs,
     }
 }
 
@@ -240,18 +398,27 @@ fn validate(cfg: EngineConfig) -> EngineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperion_core::config::{DeviceConfig, StickMode};
+    use hyperion_core::config::StickMode;
+    use hyperion_core::input::Control;
+    use hyperion_core::map::{BindTarget, KeyKind, PadBtn, Profile};
     use hyperion_core::rc::RcConfig;
 
-    /// A config with a single device `"dev"` whose left stick runs the RC filter, so edits have
-    /// something concrete to target.
-    fn store_with_device() -> ConfigStore {
+    /// A config with one device `"dev"` assigned to a `"default"` profile, so profile edits have
+    /// a concrete target reachable both directly (by profile id) and via the device assignment.
+    fn store_with_profile() -> ConfigStore {
         let mut cfg = EngineConfig {
             active_device: "dev".to_string(),
             ..EngineConfig::default()
         };
-        cfg.devices
-            .insert("dev".to_string(), DeviceConfig::default());
+        Arc::make_mut(&mut cfg.profiles).insert(
+            "default".to_string(),
+            Profile {
+                name: "default".to_string(),
+                ..Profile::default()
+            },
+        );
+        cfg.assignments
+            .insert("dev".to_string(), "default".to_string());
         ConfigStore::new(cfg)
     }
 
@@ -303,13 +470,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_set_stick_mode_changes_snapshot_and_bumps_generation() {
-        let store = store_with_device();
+    fn apply_set_stick_mode_targets_assigned_profile() {
+        let store = store_with_profile();
         let g0 = store.generation();
-        assert_eq!(
-            store.snapshot().devices["dev"].ls.mode,
-            StickMode::None,
-            "default left-stick mode is None"
+        assert!(
+            !store.snapshot().profiles["default"].ls.rc_mode_on,
+            "default left-stick RC stage is off"
         );
 
         let changed = store.apply(&ControlMsg::SetStickMode {
@@ -318,14 +484,14 @@ mod tests {
             mode: StickMode::Rc,
         });
 
-        assert!(changed, "switching the mode is a real change");
-        assert_eq!(store.snapshot().devices["dev"].ls.mode, StickMode::Rc);
+        assert!(changed, "switching the RC stage on is a real change");
+        assert!(store.snapshot().profiles["default"].ls.rc_mode_on);
         assert_eq!(store.generation(), g0 + 1, "generation bumped exactly once");
     }
 
     #[test]
-    fn apply_set_rc_clamps_out_of_range_values() {
-        let store = store_with_device();
+    fn apply_set_rc_clamps_and_targets_assigned_profile() {
+        let store = store_with_profile();
         // Wildly out-of-range RC params; the writer must clamp via core before publishing.
         let rc = RcConfig {
             enabled: true,
@@ -340,22 +506,182 @@ mod tests {
         });
 
         assert!(changed);
-        let stored = store.snapshot().devices["dev"].rs.rc;
+        let stored = store.snapshot().profiles["default"].rs.rc;
         let expected = rc.clamped();
-        assert_eq!(
-            stored.period_us, expected.period_us,
-            "period clamped up to the minimum"
-        );
+        assert_eq!(stored.period_us, expected.period_us, "period clamped up");
         assert_eq!(
             stored.fixed_param, expected.fixed_param,
-            "fixed_param clamped down to the maximum"
+            "param clamped down"
         );
         assert!(stored.enabled);
     }
 
     #[test]
+    fn apply_set_binding_mutates_and_bumps_generation() {
+        let store = store_with_profile();
+        let g0 = store.generation();
+        let changed = store.apply(&ControlMsg::SetBinding {
+            profile: "default".to_string(),
+            control: Control::Cross,
+            bind: BindTarget::GamepadButton(PadBtn::B),
+        });
+        assert!(changed, "binding Cross->B is a real change");
+        let snap = store.snapshot();
+        assert_eq!(
+            snap.profiles["default"].bindings[&Control::Cross].bind,
+            BindTarget::GamepadButton(PadBtn::B)
+        );
+        assert_eq!(store.generation(), g0 + 1);
+
+        // Clearing it removes the slot (back to identity passthrough).
+        let cleared = store.apply(&ControlMsg::ClearBinding {
+            profile: "default".to_string(),
+            control: Control::Cross,
+        });
+        assert!(cleared);
+        assert!(!store.snapshot().profiles["default"]
+            .bindings
+            .contains_key(&Control::Cross));
+    }
+
+    #[test]
+    fn apply_set_binding_to_key_survives_round_trip() {
+        let store = store_with_profile();
+        let changed = store.apply(&ControlMsg::SetBinding {
+            profile: "default".to_string(),
+            control: Control::Square,
+            bind: BindTarget::Key {
+                vk: 0x41,
+                kind: KeyKind::HOLD,
+            },
+        });
+        assert!(changed);
+        assert_eq!(
+            store.snapshot().profiles["default"].bindings[&Control::Square].bind,
+            BindTarget::Key {
+                vk: 0x41,
+                kind: KeyKind::HOLD
+            }
+        );
+    }
+
+    #[test]
+    fn apply_create_then_assign_profile() {
+        let store = store_with_profile();
+        // Create a second profile and assign it to the device.
+        assert!(store.apply(&ControlMsg::CreateProfile {
+            name: "fps".to_string(),
+        }));
+        assert!(store.snapshot().profiles.contains_key("fps"));
+
+        let g_before = store.generation();
+        assert!(store.apply(&ControlMsg::SetActiveProfile {
+            device: "dev".to_string(),
+            name: "fps".to_string(),
+        }));
+        assert_eq!(store.snapshot().assignments["dev"], "fps");
+        assert_eq!(store.generation(), g_before + 1);
+    }
+
+    #[test]
+    fn apply_assign_unknown_profile_is_noop() {
+        let store = store_with_profile();
+        let g0 = store.generation();
+        let changed = store.apply(&ControlMsg::SetActiveProfile {
+            device: "dev".to_string(),
+            name: "missing".to_string(),
+        });
+        assert!(!changed, "assigning a non-existent profile is a no-op");
+        assert_eq!(store.generation(), g0);
+        assert_eq!(store.snapshot().assignments["dev"], "default");
+    }
+
+    #[test]
+    fn apply_set_active_profile_to_current_is_noop() {
+        let store = store_with_profile();
+        let g0 = store.generation();
+        let changed = store.apply(&ControlMsg::SetActiveProfile {
+            device: "dev".to_string(),
+            name: "default".to_string(),
+        });
+        assert!(
+            !changed,
+            "re-assigning the same profile must report no change"
+        );
+        assert_eq!(store.generation(), g0);
+    }
+
+    #[test]
+    fn apply_delete_profile_drops_assignment() {
+        let store = store_with_profile();
+        assert!(store.apply(&ControlMsg::DeleteProfile {
+            name: "default".to_string(),
+        }));
+        let snap = store.snapshot();
+        assert!(!snap.profiles.contains_key("default"));
+        assert!(
+            !snap.assignments.contains_key("dev"),
+            "deleting a profile drops the assignment that pointed at it"
+        );
+    }
+
+    #[test]
+    fn apply_rename_profile_repoints_assignment() {
+        let store = store_with_profile();
+        assert!(store.apply(&ControlMsg::RenameProfile {
+            from: "default".to_string(),
+            to: "renamed".to_string(),
+        }));
+        let snap = store.snapshot();
+        assert!(snap.profiles.contains_key("renamed"));
+        assert!(!snap.profiles.contains_key("default"));
+        assert_eq!(snap.assignments["dev"], "renamed");
+    }
+
+    #[test]
+    fn apply_set_stick_settings_clamps() {
+        let store = store_with_profile();
+        let base = hyperion_core::stick::settings::StickSettings::default();
+        let settings = hyperion_core::stick::settings::StickSettings {
+            sensitivity: 2.0,
+            dead_zone: hyperion_core::stick::settings::StickDeadZone {
+                dead_zone: 9_999, // above the 127 clamp
+                ..base.dead_zone
+            },
+            ..base
+        };
+        let changed = store.apply(&ControlMsg::SetStickSettings {
+            profile: "default".to_string(),
+            stick: Stick::Left,
+            settings,
+        });
+        assert!(changed);
+        let stored = store.snapshot().profiles["default"].ls;
+        assert_eq!(stored.dead_zone.dead_zone, 127, "deadzone clamped to 127");
+        assert_eq!(stored.sensitivity, 2.0);
+    }
+
+    #[test]
+    fn apply_set_trigger_settings_clamps() {
+        let store = store_with_profile();
+        // max_zone clamps to [1,100]; the default is already 100, so use a below-range value
+        // (0 -> 1) to produce a genuine change AND exercise the clamp.
+        let settings = hyperion_core::trigger::TriggerSettings {
+            max_zone: 0, // below the 1 clamp
+            ..hyperion_core::trigger::TriggerSettings::default()
+        };
+        let changed = store.apply(&ControlMsg::SetTriggerSettings {
+            profile: "default".to_string(),
+            trigger: Trigger::Right,
+            settings,
+        });
+        assert!(changed);
+        assert_eq!(store.snapshot().profiles["default"].r2.max_zone, 1);
+    }
+
+    #[test]
     fn apply_noop_returns_false_without_bumping_generation() {
-        let store = store_with_device();
+        let store = store_with_profile();
         let g0 = store.generation();
 
         // Setting the active device to its current value is a genuine no-op.
@@ -363,19 +689,32 @@ mod tests {
         assert!(!changed, "re-setting the same value must report no change");
         assert_eq!(store.generation(), g0, "no-op must not bump the generation");
 
-        // Editing an unknown device is also a no-op.
-        let unknown = store.apply(&ControlMsg::SetStickMode {
-            device: "missing".to_string(),
-            stick: Stick::Left,
-            mode: StickMode::Rc,
+        // Editing an unknown profile is also a no-op.
+        let unknown = store.apply(&ControlMsg::SetBinding {
+            profile: "missing".to_string(),
+            control: Control::Cross,
+            bind: BindTarget::GamepadButton(PadBtn::A),
         });
-        assert!(!unknown, "editing an absent device changes nothing");
+        assert!(!unknown, "editing an absent profile changes nothing");
+        assert_eq!(store.generation(), g0);
+    }
+
+    #[test]
+    fn m4_m5_messages_are_accepted_noops() {
+        let store = store_with_profile();
+        let g0 = store.generation();
+        // A macro upsert is accepted but does nothing in M3 (no panic, no bump).
+        assert!(!store.apply(&ControlMsg::DeleteMacro {
+            profile: "default".to_string(),
+            id: 1,
+        }));
+        assert!(!store.apply(&ControlMsg::SetAutoSwitchEnabled(true)));
         assert_eq!(store.generation(), g0);
     }
 
     #[test]
     fn save_and_reload_without_path_are_noops() {
-        let store = store_with_device();
+        let store = store_with_profile();
         let g0 = store.generation();
         assert!(!store.apply(&ControlMsg::SaveToDisk));
         assert!(!store.apply(&ControlMsg::ReloadFromDisk));

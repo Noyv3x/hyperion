@@ -1,0 +1,21 @@
+[package]
+name = "kbm-output"
+description = "Windows-only keyboard/mouse output for Hyperion: drains a core KbmBatch and realizes its key/mouse edges via one batched SendInput per report (scancode + edge-deduped), with release-all on disable/profile-switch/shutdown."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The crate is `#![cfg(windows)]` end-to-end; `hyperion-core` (pure, KbmBatch/KbmEvent) and the
+# `windows` Win32 bindings are only needed on Windows, so both are cfg(windows) deps. The crate
+# compiles to an empty lib on non-Windows targets (Linux CI just type-checks the shell).
+[target.'cfg(windows)'.dependencies]
+hyperion-core = { path = "../core" }
+windows = { version = "0.62", features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Foundation",
+] }
+
+[lints]
+workspace = true

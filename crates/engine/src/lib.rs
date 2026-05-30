@@ -7,11 +7,13 @@
 //! unit-tested on Linux CI. The Windows-only pieces (`hot`, `supervisor`, `run`) wire the real
 //! HID/ViGEm/HidHide I/O and are type-checked on `windows-latest`.
 //!
-//! Concurrency primitives (see §6 "Lock-free hot-swap topology"):
+//! Concurrency primitives (see §6 "Lock-free hot-swap topology" + blueprint §7.3):
 //! * config GUI/supervisor → HOT: [`handoff::ConfigHandle`] (`Arc<ArcSwap<EngineConfig>>`),
 //! * telemetry HOT → GUI: [`handoff::TelemetryTx`]/[`handoff::TelemetryRx`] (`triple-buffer`),
 //! * commands GUI/supervisor → HOT: **two** SPSC [`handoff::CommandTx`] queues drained by the
-//!   hot loop via [`handoff::CommandRx`] (`rtrb`).
+//!   hot loop via [`handoff::CommandRx`] (`rtrb`),
+//! * KBM egress HOT → injector: a third SPSC [`handoff::KbmTx`]/[`handoff::KbmRx`] `rtrb` ring of
+//!   `Copy` `KbmBatch`es; the hot loop pushes drop-on-full, the `KbmInjector` thread drains it.
 //!
 //! No `Mutex` lives on the hot path.
 
@@ -25,9 +27,11 @@ pub mod seq;
 pub mod telemetry;
 
 #[doc(inline)]
-pub use control::{ControlMsg, Stick};
+pub use control::{ControlMsg, Stick, Trigger};
 #[doc(inline)]
 pub use error::EngineError;
+#[doc(inline)]
+pub use handoff::{KbmRx, KbmTx};
 #[doc(inline)]
 pub use runtime::Runtime;
 

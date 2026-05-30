@@ -1056,6 +1056,7 @@ dependencies = [
  "crossbeam-channel",
  "hid-input",
  "hyperion-core",
+ "kbm-output",
  "platform-win",
  "rtrb",
  "triple_buffer",
@@ -2015,6 +2016,14 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kbm-output"
+version = "0.0.0"
+dependencies = [
+ "hyperion-core",
+ "windows 0.62.2",
 ]
 
 [[package]]

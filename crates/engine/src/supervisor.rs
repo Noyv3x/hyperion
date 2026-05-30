@@ -16,9 +16,9 @@ use std::thread::JoinHandle;
 use hyperion_core::config::EngineConfig;
 
 use crate::config_store::ConfigStore;
-use crate::handoff::{self, CommandTx, ConfigHandle, TelemetryRx};
+use crate::handoff::{self, CommandTx, ConfigHandle, KbmRx, KbmTx, TelemetryRx};
 use crate::hot::{HotThread, StopReason};
-use crate::win_io::{DualSenseDevice, Vigem360Target};
+use crate::win_io::{spawn_kbm_injector, DualSenseDevice, Vigem360Target};
 
 // `EngineError` is shared with the cross-platform `Runtime`, so it lives in `crate::error`;
 // re-export it here so `engine::supervisor::EngineError` stays a valid path.
@@ -41,6 +41,9 @@ pub struct Supervisor {
     sup_tx: Option<CommandTx>,
     /// Telemetry reader (handed to the GUI in M2; held here for now).
     telemetry_rx: Option<TelemetryRx>,
+    /// KBM egress consumer (HOT → injector). Taken at [`Supervisor::spawn`] to start the
+    /// injector thread; `None` once consumed.
+    kbm_rx: Option<KbmRx>,
     /// Built once and moved onto the hot thread at spawn.
     hot_links: Option<HotLinks>,
 }
@@ -49,6 +52,8 @@ pub struct Supervisor {
 struct HotLinks {
     commands: handoff::CommandRx,
     telemetry: handoff::TelemetryTx,
+    /// KBM egress producer the hot loop pushes one batch per report into (drop-on-full).
+    kbm_tx: KbmTx,
 }
 
 impl Supervisor {
@@ -60,7 +65,7 @@ impl Supervisor {
 
     /// Build the supervisor from an explicit config snapshot.
     pub fn with_config(cfg: EngineConfig) -> Result<Self, EngineError> {
-        let (config, (telemetry_tx, telemetry_rx), (gui_tx, sup_tx, command_rx)) =
+        let (config, (telemetry_tx, telemetry_rx), (gui_tx, sup_tx, command_rx), (kbm_tx, kbm_rx)) =
             handoff::build_links(cfg);
 
         // The store and the hot loop share the same ArcSwap + generation counter.
@@ -74,9 +79,11 @@ impl Supervisor {
             gui_tx: Some(gui_tx),
             sup_tx: Some(sup_tx),
             telemetry_rx: Some(telemetry_rx),
+            kbm_rx: Some(kbm_rx),
             hot_links: Some(HotLinks {
                 commands: command_rx,
                 telemetry: telemetry_tx,
+                kbm_tx,
             }),
         })
     }
@@ -152,6 +159,18 @@ impl Supervisor {
         // thread returns `DeviceLost` cleanly, so the headless slice exits without error.
         let hot_links = self.hot_links.take();
 
+        // (2b) Spawn the KBM injector thread (normal priority). It drains the egress ring and
+        // realizes key/mouse edges via SendInput entirely off the hot thread (blueprint §7.3). It
+        // exits on its own once the hot thread's `KbmTx` is dropped and the ring is drained, so no
+        // explicit stop channel is needed — `RunningSupervisor::join` joins it after the hot
+        // thread has finished (which drops the `KbmTx`).
+        let kbm_injector = match self.kbm_rx.take() {
+            Some(kbm_rx) => {
+                Some(spawn_kbm_injector(kbm_rx).map_err(|e| EngineError::Platform(e.to_string()))?)
+            }
+            None => None,
+        };
+
         // (3) Spawn the hot thread with the policy guard bound inside it (or `None` if there is
         // nothing to drive, which still joins cleanly).
         let handle = match hot_links {
@@ -164,8 +183,12 @@ impl Supervisor {
             None => None,
         };
 
+        // TODO(M5): spawn the `ForegroundWatcher` (auto-profile-switch) on its own named thread
+        // here, with its own stop channel and a clone of `control_tx`, joined before the writer.
+
         Ok(RunningSupervisor {
             handle,
+            kbm_injector,
             _timer_res: timer_res,
         })
     }
@@ -188,24 +211,41 @@ impl Supervisor {
 pub struct RunningSupervisor {
     /// `None` when there was nothing to drive (no hot links); `join` is then trivially `Ok`.
     handle: Option<JoinHandle<StopReason>>,
+    /// The KBM injector thread (blueprint §7.3). Joined strictly *after* the hot thread, whose
+    /// exit drops the `KbmTx` and so signals the injector to drain-and-exit. `None` if no ring
+    /// consumer was available.
+    kbm_injector: Option<JoinHandle<()>>,
     /// Restored on drop, after `handle` has joined.
     _timer_res: platform_win::TimerResGuard,
 }
 
 impl RunningSupervisor {
-    /// Block until the hot thread exits, then drop the timer-resolution guard.
+    /// Block until the hot thread exits, join the KBM injector, then drop the timer-resolution
+    /// guard.
     ///
-    /// `StopReason::Shutdown` / `DeviceLost` are both clean exits; a panicked hot thread maps to
-    /// [`EngineError::HotPanic`].
+    /// Ordering: join the hot thread first (its exit drops the `KbmTx`, which is the injector's
+    /// drain-and-exit signal), then join the injector. `StopReason::Shutdown` / `DeviceLost` are
+    /// both clean exits; a panicked hot thread maps to [`EngineError::HotPanic`].
     pub fn join(self) -> Result<(), EngineError> {
-        match self.handle {
+        let hot_result = match self.handle {
             Some(handle) => match handle.join() {
                 Ok(StopReason::Shutdown) | Ok(StopReason::DeviceLost) => Ok(()),
                 Err(_) => Err(EngineError::HotPanic),
             },
             None => Ok(()),
+        };
+
+        // The hot thread is gone (its `KbmTx` dropped); the injector now drains the ring and
+        // returns on its own. A panicked injector is non-fatal to shutdown — log-and-continue so
+        // the hot-thread result and the timer-resolution restore still propagate.
+        if let Some(injector) = self.kbm_injector {
+            if injector.join().is_err() {
+                eprintln!("hyperion: KBM injector thread panicked during shutdown");
+            }
         }
-        // `_timer_res` drops here, after the join.
+
+        hot_result
+        // `_timer_res` drops here, after both joins.
     }
 }
 
@@ -227,6 +267,7 @@ fn spawn_hot(
     let HotLinks {
         commands,
         telemetry,
+        kbm_tx,
     } = links;
 
     let handle = std::thread::Builder::new()
@@ -248,8 +289,12 @@ fn spawn_hot(
             };
 
             // (4) Run the steady-state loop. The HidHide cloak (held inside `device`), the
-            // ViGEm target, and `_policy` all drop on this thread when `run` returns.
-            HotThread::new(device, target, config, config_gen, commands, telemetry).run()
+            // ViGEm target, `_policy`, and the `KbmTx` (dropped here, signaling the injector to
+            // drain-and-exit) all release on this thread when `run` returns.
+            HotThread::new(
+                device, target, config, config_gen, commands, telemetry, kbm_tx,
+            )
+            .run()
         })
         .map_err(|e| EngineError::Platform(e.to_string()))?;
     Ok(handle)

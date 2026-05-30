@@ -26,8 +26,9 @@
 //! (timestamp tick scale and the DSE paddle/Fn/Mute superset in `btn2` are under-documented
 //! for the Edge); the stick bytes 1-4 are **SOLID**.
 
-use super::normalize::u8_stick_to_axis;
-use super::StickPair;
+use super::normalize::{u8_stick_to_axis, u8_trigger};
+use super::state::ControllerState;
+use super::{SourceMeta, StickPair};
 
 /// DS4-compatible USB input report id.
 pub const DS_USB_REPORT_ID: u8 = 0x01;
@@ -92,6 +93,94 @@ pub fn ds_report_to_sticks(r: &DsReport) -> (StickPair, StickPair) {
         y: -u8_stick_to_axis(r.ry),
     };
     (left, right)
+}
+
+/// Decode the 4-bit D-pad hat nibble (`btn0 & 0x0F`) into `(up, right, down, left)` bools.
+///
+/// `0..=7` are the 8 compass directions (`0`=N, `2`=E, `4`=S, `6`=W, odd values diagonals);
+/// `8` (and any out-of-range value) is neutral. This is the single source of truth promoted
+/// from `engine/src/win_io.rs::ds_buttons_to_xinput`.
+#[inline]
+pub fn decode_dpad_hat(nibble: u8) -> (bool, bool, bool, bool) {
+    match nibble & 0x0F {
+        0 => (true, false, false, false),  // N
+        1 => (true, true, false, false),   // NE
+        2 => (false, true, false, false),  // E
+        3 => (false, true, true, false),   // SE
+        4 => (false, false, true, false),  // S
+        5 => (false, false, true, true),   // SW
+        6 => (false, false, false, true),  // W
+        7 => (true, false, false, true),   // NW
+        _ => (false, false, false, false), // 8 (and 9..=15) neutral
+    }
+}
+
+/// Decode buttons + triggers + (capability-gated) sensors/touch from an already-parsed
+/// [`DsReport`] plus the full report buffer into the structured [`ControllerState`].
+///
+/// Sticks reuse [`ds_report_to_sticks`] verbatim (no duplicate offsets); triggers carry both
+/// the analog `[0,1]` and the raw `u8`. The btn0/btn1/btn2 bit map is the one promoted from
+/// `engine/src/win_io.rs::ds_buttons_to_xinput`:
+/// * `btn0` (byte 5): low nibble = D-pad hat (decoded via [`decode_dpad_hat`]); high nibble =
+///   Square `0x10`, Cross `0x20`, Circle `0x40`, Triangle `0x80`.
+/// * `btn1` (byte 6): L1 `0x01`, R1 `0x02`, L2-click `0x04`, R2-click `0x08`, Share `0x10`,
+///   Options `0x20`, L3 `0x40`, R3 `0x80`.
+/// * `btn2` (byte 7): PS `0x01`, TouchButton `0x02` (upper 6 bits = frame counter, consumed).
+///
+/// **Capability gate:** Mute/Capture and the DualSense Edge Fn/paddle/side bits live in the
+/// extended Edge report; they are decoded only when `meta.is_edge` is set, else read `false`.
+/// Touch contacts and motion sensors are HW-verify (M5/M6) — left at their `Default` (`0`)
+/// until those decodes land, so the Control variants are valid indices but inert.
+pub fn decode_controller_state(r: &DsReport, _buf: &[u8], meta: &SourceMeta) -> ControllerState {
+    let (left, right) = ds_report_to_sticks(r);
+    let (dpad_up, dpad_right, dpad_down, dpad_left) = decode_dpad_hat(r.btn0);
+
+    // The Edge superset (Mute/Capture, Fn/paddle/side) is decoded only for Edge-capable
+    // sources; the bit positions live in the extended report and land in M6. Until then every
+    // gated field reads `false` even on an Edge source, but the gate is wired so M6 is additive.
+    let _is_edge = meta.is_edge;
+
+    ControllerState {
+        lx: left.x,
+        ly: left.y,
+        rx: right.x,
+        ry: right.y,
+        l2: u8_trigger(r.l2),
+        r2: u8_trigger(r.r2),
+        l2_raw: r.l2,
+        r2_raw: r.r2,
+        // Face buttons (high nibble of btn0).
+        square: r.btn0 & 0x10 != 0,
+        cross: r.btn0 & 0x20 != 0,
+        circle: r.btn0 & 0x40 != 0,
+        triangle: r.btn0 & 0x80 != 0,
+        dpad_up,
+        dpad_down,
+        dpad_left,
+        dpad_right,
+        // Shoulders / stick clicks / meta (btn1).
+        l1: r.btn1 & 0x01 != 0,
+        r1: r.btn1 & 0x02 != 0,
+        share: r.btn1 & 0x10 != 0,
+        options: r.btn1 & 0x20 != 0,
+        l3: r.btn1 & 0x40 != 0,
+        r3: r.btn1 & 0x80 != 0,
+        // System (btn2).
+        ps: r.btn2 & 0x01 != 0,
+        touch_button: r.btn2 & 0x02 != 0,
+        // Edge superset (HW-verify) — inert until the M6 extended-report decode lands.
+        mute: false,
+        capture: false,
+        fn_l: false,
+        fn_r: false,
+        blp: false,
+        brp: false,
+        side_l: false,
+        side_r: false,
+        // Touch contacts + motion: HW-verify (M5/M6), inert at Default.
+        touch: Default::default(),
+        motion: Default::default(),
+    }
 }
 
 #[cfg(test)]
@@ -192,5 +281,127 @@ mod tests {
         assert_eq!(r.btn1, 0x5A);
         assert_eq!(r.btn2, 0xC3);
         assert_eq!(r.counter, 0x30);
+    }
+
+    // --- decode_controller_state ---
+
+    use crate::input::control::{Control, Thresholds};
+
+    const META: SourceMeta = SourceMeta {
+        vid: 0x054C,
+        pid: 0x0CE6,
+        name: "test",
+        stick_bits: 8,
+        is_edge: false,
+    };
+
+    /// Build a report with explicit btn bytes (and neutral sticks/triggers).
+    fn synth_btn(btn0: u8, btn1: u8, btn2: u8) -> [u8; 64] {
+        let mut b = synth(0x80, 0x80, 0x80, 0x80, 0, 0, 0, 0);
+        b[5] = btn0;
+        b[6] = btn1;
+        b[7] = btn2;
+        b
+    }
+
+    fn decode(b: &[u8]) -> ControllerState {
+        let r = parse_ds_usb_report(b).unwrap();
+        decode_controller_state(&r, b, &META)
+    }
+
+    #[test]
+    fn decode_sticks_equal_ds_report_to_sticks() {
+        // No duplicate offsets: the state's sticks must equal ds_report_to_sticks exactly.
+        let b = synth(0x12, 0x34, 0xCD, 0xEF, 0x55, 0xAA, 0, 0);
+        let r = parse_ds_usb_report(&b).unwrap();
+        let (l, rr) = ds_report_to_sticks(&r);
+        let s = decode_controller_state(&r, &b, &META);
+        assert_eq!(s.lx, l.x);
+        assert_eq!(s.ly, l.y);
+        assert_eq!(s.rx, rr.x);
+        assert_eq!(s.ry, rr.y);
+        // And triggers match u8_trigger + raw.
+        assert_eq!(s.l2, u8_trigger(0x55));
+        assert_eq!(s.r2, u8_trigger(0xAA));
+        assert_eq!(s.l2_raw, 0x55);
+        assert_eq!(s.r2_raw, 0xAA);
+    }
+
+    #[test]
+    fn every_btn0_high_nibble_bit_flips_the_right_face_button() {
+        // hat low nibble = 8 (neutral) so only face bits are exercised.
+        assert!(decode(&synth_btn(0x18, 0, 0)).square);
+        assert!(decode(&synth_btn(0x28, 0, 0)).cross);
+        assert!(decode(&synth_btn(0x48, 0, 0)).circle);
+        assert!(decode(&synth_btn(0x88, 0, 0)).triangle);
+        // A bit set does not bleed into the others.
+        let s = decode(&synth_btn(0x28, 0, 0));
+        assert!(s.cross && !s.square && !s.circle && !s.triangle);
+    }
+
+    #[test]
+    fn every_btn1_bit_flips_the_right_control() {
+        assert!(decode(&synth_btn(8, 0x01, 0)).l1);
+        assert!(decode(&synth_btn(8, 0x02, 0)).r1);
+        assert!(decode(&synth_btn(8, 0x10, 0)).share);
+        assert!(decode(&synth_btn(8, 0x20, 0)).options);
+        assert!(decode(&synth_btn(8, 0x40, 0)).l3);
+        assert!(decode(&synth_btn(8, 0x80, 0)).r3);
+        let s = decode(&synth_btn(8, 0x40, 0));
+        assert!(s.l3 && !s.r3 && !s.l1);
+    }
+
+    #[test]
+    fn every_btn2_bit_flips_the_right_control() {
+        assert!(decode(&synth_btn(8, 0, 0x01)).ps);
+        assert!(decode(&synth_btn(8, 0, 0x02)).touch_button);
+        let s = decode(&synth_btn(8, 0, 0x02));
+        assert!(s.touch_button && !s.ps);
+    }
+
+    #[test]
+    fn all_nine_dpad_nibbles_decode() {
+        // (nibble, up, right, down, left)
+        let cases = [
+            (0u8, true, false, false, false),
+            (1, true, true, false, false),
+            (2, false, true, false, false),
+            (3, false, true, true, false),
+            (4, false, false, true, false),
+            (5, false, false, true, true),
+            (6, false, false, false, true),
+            (7, true, false, false, true),
+            (8, false, false, false, false),
+        ];
+        for (nib, up, right, down, left) in cases {
+            let s = decode(&synth_btn(nib, 0, 0));
+            assert_eq!(s.dpad_up, up, "nibble {nib} up");
+            assert_eq!(s.dpad_right, right, "nibble {nib} right");
+            assert_eq!(s.dpad_down, down, "nibble {nib} down");
+            assert_eq!(s.dpad_left, left, "nibble {nib} left");
+        }
+    }
+
+    #[test]
+    fn edge_fields_inert_when_not_edge_capable() {
+        let s = decode(&synth_btn(0xF8, 0xFF, 0xFF));
+        // Edge superset stays false regardless of which raw bits are set.
+        assert!(!s.mute && !s.capture && !s.fn_l && !s.fn_r);
+        assert!(!s.blp && !s.brp && !s.side_l && !s.side_r);
+        // Touch/motion inert.
+        assert_eq!(s.touch, [crate::input::TouchContact::default(); 2]);
+        assert_eq!(s.motion, crate::input::Motion::default());
+    }
+
+    #[test]
+    fn full_pull_digital_view_from_raw_trigger() {
+        let t = Thresholds::default();
+        let mut b = synth(0x80, 0x80, 0x80, 0x80, 255, 100, 0, 0);
+        b[5] = 8; // neutral hat
+        let s = decode(&b);
+        assert!(s.pressed(Control::L2FullPull, &t));
+        assert!(!s.pressed(Control::R2FullPull, &t)); // 100 != 255
+                                                      // analog ~ raw/255 within 1e-12.
+        assert!((s.analog(Control::R2) - 100.0 / 255.0).abs() < 1e-12);
     }
 }

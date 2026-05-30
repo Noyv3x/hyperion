@@ -1,7 +1,7 @@
-//! The live egui tuning GUI (Windows-only).
+//! The live egui tuning + remap GUI (Windows-only).
 //!
 //! [`HyperionApp`] implements [`eframe::App`]. It runs on the eframe/winit **main thread** and is
-//! wholly decoupled from the engine's hot loop (`DESIGN.md` §6/§10):
+//! wholly decoupled from the engine's hot loop (`DESIGN.md` §6/§10, `DESIGN-REMAP.md` §8):
 //!
 //! * it **reads** the latest [`engine::telemetry::TelemetryFrame`] from a triple-buffer every
 //!   frame (wait-free; the hot loop never blocks), and
@@ -9,11 +9,20 @@
 //!   config-writer thread — it never mutates the shared config `ArcSwap` and never takes a lock
 //!   the hot loop uses.
 //!
-//! Widget state lives in a local editable mirror ([`DeviceMirror`]) seeded once from the
-//! snapshot the runtime hands over at construction. Any widget change rebuilds the affected
-//! [`hyperion_core::rc::RcConfig`] / [`hyperion_core::config::StickMode`] / thread / hidhide
-//! value and sends the corresponding `ControlMsg`; the engine is the sole writer that validates,
-//! clamps, and republishes.
+//! Widget state lives in a local editable mirror ([`ProfileMirror`]) seeded once from the
+//! snapshot the runtime hands over at construction. The snapshot resolves the active **device** to
+//! its assigned **profile** (`device → assignments → profiles`), and the mirror clones that
+//! profile's stick settings + bindings. Any widget change rebuilds the affected value
+//! ([`hyperion_core::stick::settings::StickSettings`] / [`hyperion_core::rc::RcConfig`] /
+//! [`hyperion_core::map::BindingSlot`] / thread / hidhide) and sends the corresponding
+//! `ControlMsg`; the engine is the sole writer that validates, clamps, and republishes.
+//!
+//! M3 scope (`DESIGN-REMAP.md` §12): this is the **minimal coherent** remap surface — the existing
+//! RC panel now edits the active profile's `ls`/`rs` RC sub-config, a stick-settings panel exposes
+//! deadzone / sensitivity / curve, and a single binding row lets the user pick a `Control` and bind
+//! it to a `GamepadButton` or a captured `Key`. The full editor (per-control diagram, macros, gyro,
+//! profile manager) is fleshed out across M3/M4 in the screens named in §8; everything routes
+//! through `ControlMsg` (single writer) and never touches the hot loop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,10 +33,13 @@ use engine::config::EngineConfig;
 use engine::handoff::TelemetryRx;
 use engine::telemetry::TelemetryFrame;
 use engine::{ControlMsg, Stick};
-use hyperion_core::config::{DeviceConfig, HidHideConfig, StickConfig, StickMode, ThreadConfig};
+use hyperion_core::config::{HidHideConfig, ThreadConfig};
+use hyperion_core::stick::settings::StickSettings;
 
+mod bindings;
 mod panels;
 mod scope;
+mod sticks;
 mod tray;
 
 use tray::TrayState;
@@ -54,6 +66,33 @@ const REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 /// How many recent output points to keep per stick for the scope trail.
 const TRAIL_LEN: usize = 48;
 
+/// The top-level tabs (`DESIGN-REMAP.md` §8). M3 ships **Mapping**, **Sticks**, and **Engine**;
+/// the Triggers / Mouse-Gyro / Macros / Profiles screens land additively in later milestones, so
+/// they are intentionally absent from this enum rather than stubbed as empty panels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    /// Per-control binding editor (the basic `Control → Binding` remap row).
+    Mapping,
+    /// Per-stick settings: RC sub-section + deadzone / sensitivity / curve.
+    Sticks,
+    /// Global engine policy: thread / scheduling + HidHide.
+    Engine,
+}
+
+impl Tab {
+    /// The tab strip, in display order.
+    const ALL: [Tab; 3] = [Tab::Mapping, Tab::Sticks, Tab::Engine];
+
+    /// Display label.
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Mapping => "Mapping",
+            Tab::Sticks => "Sticks",
+            Tab::Engine => "Engine",
+        }
+    }
+}
+
 /// The eframe application: telemetry reader, control sender, and the editable config mirror.
 pub struct HyperionApp {
     /// GUI → engine config-writer channel. The GUI only ever *sends*; the writer is the sole
@@ -68,34 +107,46 @@ pub struct HyperionApp {
     rs_trail: Vec<egui::Vec2>,
     /// The id of the device the GUI is currently editing (the active device at seed time).
     active_device: String,
-    /// Local editable mirror of the active device's config (seeded from the snapshot).
-    mirror: DeviceMirror,
+    /// Local editable mirror of the active device's profile (seeded from the snapshot).
+    mirror: ProfileMirror,
     /// Editable mirror of the global thread + hidhide policy.
     thread: ThreadConfig,
     hidhide: HidHideConfig,
+    /// The currently selected top-level tab.
+    tab: Tab,
+    /// Transient binding-editor state (the M3 `Control → Binding` row); never persisted.
+    binding_editor: bindings::BindingEditor,
     /// The system-tray handle + menu ids; built once the eframe/winit loop is live (see
     /// [`HyperionApp::with_tray`]). `None` if tray creation failed (the GUI still works).
     tray: Option<TrayState>,
 }
 
-/// A local, editable copy of one device's two stick configs. This is the GUI's source of truth
-/// for widget values; edits here are mirrored to the engine via `ControlMsg`.
-pub struct DeviceMirror {
-    pub ls: StickConfig,
-    pub rs: StickConfig,
+/// A local, editable copy of the active profile's stick settings and bindings.
+///
+/// This is the GUI's source of truth for widget values; edits here are mirrored to the engine via
+/// `ControlMsg`. It replaces the M2 `DeviceMirror` (which cloned two `StickConfig`s out of the
+/// device) — sticks now live on the [`Profile`](hyperion_core::map::Profile) (`DESIGN-REMAP.md`
+/// §3.6 / §9), so the mirror is seeded from the resolved active profile instead.
+pub struct ProfileMirror {
+    /// The id of the profile assigned to the active device (the edit target).
+    pub profile: String,
+    /// Left-stick settings (RC sub-config + full pipeline params).
+    pub ls: StickSettings,
+    /// Right-stick settings.
+    pub rs: StickSettings,
 }
 
-impl DeviceMirror {
-    /// Borrow the editable stick config for `stick`.
-    pub fn stick(&self, stick: Stick) -> &StickConfig {
+impl ProfileMirror {
+    /// Borrow the editable stick settings for `stick`.
+    pub fn stick(&self, stick: Stick) -> &StickSettings {
         match stick {
             Stick::Left => &self.ls,
             Stick::Right => &self.rs,
         }
     }
 
-    /// Mutably borrow the editable stick config for `stick`.
-    pub fn stick_mut(&mut self, stick: Stick) -> &mut StickConfig {
+    /// Mutably borrow the editable stick settings for `stick`.
+    pub fn stick_mut(&mut self, stick: Stick) -> &mut StickSettings {
         match stick {
             Stick::Left => &mut self.ls,
             Stick::Right => &mut self.rs,
@@ -105,22 +156,14 @@ impl DeviceMirror {
 
 impl HyperionApp {
     /// Build the app from the engine handoffs: a control sender, the telemetry reader, and the
-    /// seed config snapshot (used to populate widget values for the active device).
+    /// seed config snapshot (used to populate widget values for the active device's profile).
     pub fn new(
         control_tx: crossbeam_channel::Sender<ControlMsg>,
         telemetry: TelemetryRx,
         snapshot: Arc<EngineConfig>,
     ) -> Self {
         let active_device = snapshot.active_device.clone();
-        let dev = snapshot
-            .devices
-            .get(&active_device)
-            .copied()
-            .unwrap_or_else(DeviceConfig::default);
-        let mirror = DeviceMirror {
-            ls: dev.ls,
-            rs: dev.rs,
-        };
+        let mirror = ProfileMirror::from_snapshot(&snapshot, &active_device);
 
         Self {
             control_tx,
@@ -132,6 +175,8 @@ impl HyperionApp {
             mirror,
             thread: snapshot.thread.clone(),
             hidhide: snapshot.hidhide.clone(),
+            tab: Tab::Mapping,
+            binding_editor: bindings::BindingEditor::default(),
             tray: None,
         }
     }
@@ -159,6 +204,40 @@ impl HyperionApp {
         push_trail(&mut self.ls_trail, self.latest.out_lx, self.latest.out_ly);
         push_trail(&mut self.rs_trail, self.latest.out_rx, self.latest.out_ry);
     }
+}
+
+impl ProfileMirror {
+    /// Resolve the active device to its assigned profile and clone that profile's stick settings
+    /// into a fresh mirror. Falls back to a default profile (all-passthrough sticks) when no
+    /// assignment / profile exists yet, so first-run (empty config) still produces a coherent
+    /// editing surface rather than panicking.
+    ///
+    /// The resolution chain is `device → assignments[device] → profiles[id]`
+    /// (`DESIGN-REMAP.md` §7.1 / §8): the assignment names the profile id the active device drives.
+    fn from_snapshot(snapshot: &EngineConfig, device: &str) -> Self {
+        let profile_id = resolve_profile_id(snapshot, device);
+        let profile = snapshot
+            .profiles
+            .get(&profile_id)
+            .cloned()
+            .unwrap_or_default();
+        Self {
+            profile: profile_id,
+            ls: profile.ls,
+            rs: profile.rs,
+        }
+    }
+}
+
+/// Resolve the profile id assigned to `device`, falling back to the literal `"default"` id when no
+/// assignment exists (matching the legacy-migration shim, `DESIGN-REMAP.md` §9, which synthesizes a
+/// `"default"` profile + assignment for an old-shape config).
+fn resolve_profile_id(snapshot: &EngineConfig, device: &str) -> String {
+    snapshot
+        .assignments
+        .get(device)
+        .cloned()
+        .unwrap_or_else(|| "default".to_string())
 }
 
 /// Append a point to a fixed-length trail, dropping the oldest when full.
@@ -196,6 +275,8 @@ impl eframe::App for HyperionApp {
                 ui.heading("Hyperion");
                 ui.separator();
                 ui.label(format!("device: {}", self.active_device));
+                ui.separator();
+                ui.label(format!("profile: {}", self.mirror.profile));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Save").clicked() {
                         self.send(ControlMsg::SaveToDisk);
@@ -204,6 +285,12 @@ impl eframe::App for HyperionApp {
                         self.send(ControlMsg::ReloadFromDisk);
                     }
                 });
+            });
+            // The top-level tab strip (§8).
+            ui.horizontal(|ui| {
+                for tab in Tab::ALL {
+                    ui.selectable_value(&mut self.tab, tab, tab.label());
+                }
             });
         });
 
@@ -220,12 +307,14 @@ impl eframe::App for HyperionApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                panels::global_panel(ui, self);
-                ui.separator();
-                panels::stick_panel(ui, self, Stick::Left);
-                ui.separator();
-                panels::stick_panel(ui, self, Stick::Right);
+            egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
+                Tab::Mapping => bindings::mapping_panel(ui, self),
+                Tab::Sticks => {
+                    sticks::stick_panel(ui, self, Stick::Left);
+                    ui.separator();
+                    sticks::stick_panel(ui, self, Stick::Right);
+                }
+                Tab::Engine => panels::global_panel(ui, self),
             });
         });
     }
@@ -234,24 +323,37 @@ impl eframe::App for HyperionApp {
 // ----- edit helpers shared by the panels: every mutation funnels through a `ControlMsg` send ---
 
 impl HyperionApp {
-    /// Apply a stick-mode change to the mirror and notify the engine.
-    pub(crate) fn set_stick_mode(&mut self, stick: Stick, mode: StickMode) {
-        self.mirror.stick_mut(stick).mode = mode;
-        self.send(ControlMsg::SetStickMode {
-            device: self.active_device.clone(),
+    /// Re-send the active profile's whole [`StickSettings`] for `stick` (after any stick-settings
+    /// or RC widget edit). The engine clamps on apply, so the GUI may send freely; the mirror keeps
+    /// the user's typed value.
+    ///
+    /// Targets the mirror's **profile** id directly (`SetStickSettings { profile, stick, settings }`,
+    /// `DESIGN-REMAP.md` §9 — sticks moved out of `DeviceConfig` into the `Profile`). The whole
+    /// `StickSettings` is sent (RC sub-config included), so the legacy `SetStickMode`/`SetRc`
+    /// per-field messages are not needed.
+    pub(crate) fn push_stick_settings(&mut self, stick: Stick) {
+        let settings = *self.mirror.stick(stick);
+        self.send(ControlMsg::SetStickSettings {
+            profile: self.mirror.profile.clone(),
             stick,
-            mode,
+            settings,
         });
     }
 
-    /// Re-send the current mirror RC params for `stick` (after any RC widget edit). The engine
-    /// clamps on apply, so the GUI may send freely; the mirror keeps the user's typed value.
-    pub(crate) fn push_rc(&mut self, stick: Stick) {
-        let rc = self.mirror.stick(stick).rc;
-        self.send(ControlMsg::SetRc {
-            device: self.active_device.clone(),
-            stick,
-            rc,
+    /// Send a single base-binding edit for `control` on the active profile. A `Passthrough`
+    /// bind is the natural "clear" (identity); any other bind is the remap.
+    ///
+    /// Targets the mirror's **profile** id (`SetBinding { profile, control, bind }`, §9). The
+    /// per-control shift / turbo fields of the slot are M4; M3 only sets the base `bind`.
+    pub(crate) fn push_binding(
+        &mut self,
+        control: hyperion_core::input::Control,
+        bind: hyperion_core::map::BindTarget,
+    ) {
+        self.send(ControlMsg::SetBinding {
+            profile: self.mirror.profile.clone(),
+            control,
+            bind,
         });
     }
 
@@ -275,9 +377,14 @@ impl HyperionApp {
         &mut self.hidhide
     }
 
-    /// Borrow the editable device mirror.
-    pub(crate) fn mirror_mut(&mut self) -> &mut DeviceMirror {
+    /// Borrow the editable profile mirror.
+    pub(crate) fn mirror_mut(&mut self) -> &mut ProfileMirror {
         &mut self.mirror
+    }
+
+    /// Borrow the transient binding-editor state.
+    pub(crate) fn binding_editor_mut(&mut self) -> &mut bindings::BindingEditor {
+        &mut self.binding_editor
     }
 }
 

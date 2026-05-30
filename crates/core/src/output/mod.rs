@@ -5,6 +5,17 @@
 //! mapping is re-used verbatim by the Windows `vgamepad-output` crate so there is one — and
 //! only one — quantization point, matching the C# `Xbox360OutDevice` `AxisScale` semantics
 //! (asymmetric `i16`: positive scaled by `32767`, negative by `32768`).
+//!
+//! Submodules:
+//! * [`state`] — the structured [`OutputState`] / [`PadButtons`] egress accumulator the mapping
+//!   engine fills, plus [`pack_xinput`] and the DS4 lowering ([`to_ds4_axis`], [`dpad_8way`]).
+//! * [`kbm`] — the fixed-capacity [`KbmBatch`] keyboard/mouse event accumulator.
+
+pub mod kbm;
+pub mod state;
+
+pub use kbm::{KbmBatch, KbmEvent, KeyKind, MouseButton, KBM_BATCH_CAP};
+pub use state::{dpad_8way, pack_xinput, to_ds4_axis, Ds4Dpad, OutputState, PadButtons, PadTarget};
 
 /// A fully-processed controller frame ready to be mapped to a virtual Xbox 360 report.
 ///

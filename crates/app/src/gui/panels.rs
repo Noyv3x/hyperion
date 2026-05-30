@@ -1,51 +1,54 @@
-//! The tuning panels: per-stick RC controls, the dynamic-curve editor, and the global
-//! thread / HidHide policy.
+//! Reusable tuning panels: the RC-filter sub-section (reused by the Sticks screen), the dynamic
+//! RC-curve editor, and the global thread / HidHide policy (the Engine tab).
 //!
-//! Every widget reads from the app's local mirror and, on change, pushes the rebuilt value to
-//! the engine through a `ControlMsg` (`super::HyperionApp::set_stick_mode` / `push_rc` /
-//! `push_thread` / `push_hidhide`). Nothing here touches the shared config `ArcSwap` directly —
-//! the engine's single writer validates and clamps every edit.
+//! Every widget reads from the app's local mirror and, on change, pushes the rebuilt value to the
+//! engine through a `ControlMsg` (`super::HyperionApp::push_stick_settings` / `push_thread` /
+//! `push_hidhide`). Nothing here touches the shared config `ArcSwap` directly — the engine's single
+//! writer validates and clamps every edit.
+//!
+//! M3 migration (`DESIGN-REMAP.md` §9): the RC parameters now live on
+//! [`hyperion_core::stick::settings::StickSettings`] (`rc` + the `rc_mode_on` selector) inside the
+//! active **profile**, not on the old per-device `StickConfig`. [`rc_controls`] edits that sub-config
+//! and re-sends the whole `StickSettings` via `SetStickSettings`. The RC algorithm / curve editor is
+//! otherwise byte-for-byte the M2 panel (it consumes the same [`hyperion_core::rc::RcConfig`]).
 
 use eframe::egui;
 use engine::Stick;
-use hyperion_core::config::{DtSource, StickMode, WaitMode};
+use hyperion_core::config::{DtSource, WaitMode};
 use hyperion_core::rc::{RcMode, MAX_PARAM, MAX_PERIOD_US, MAX_SPEED, MIN_PARAM, MIN_PERIOD_US};
 
 use super::HyperionApp;
 
-/// One per-stick (Left / Right) tuning panel.
-pub fn stick_panel(ui: &mut egui::Ui, app: &mut HyperionApp, stick: Stick) {
-    let title = match stick {
-        Stick::Left => "Left stick (LS)",
-        Stick::Right => "Right stick (RS)",
-    };
-    ui.heading(title);
-
-    // --- StickMode combo: None | Rc -----------------------------------------------------------
-    let mut mode = app.mirror_mut().stick(stick).mode;
-    egui::ComboBox::from_id_salt((title, "mode"))
-        .selected_text(mode_label(mode))
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut mode, StickMode::None, mode_label(StickMode::None));
-            ui.selectable_value(&mut mode, StickMode::Rc, mode_label(StickMode::Rc));
-        });
-    if mode != app.mirror_mut().stick(stick).mode {
-        app.set_stick_mode(stick, mode);
-    }
-
-    // The RC parameter controls are only meaningful when the stick runs the filter.
-    let editing_rc = mode == StickMode::Rc;
-    ui.add_enabled_ui(editing_rc, |ui| {
-        rc_controls(ui, app, stick);
-    });
-}
-
-/// The RC-filter parameter controls for one stick. Any change re-sends the whole `RcConfig`.
-fn rc_controls(ui: &mut egui::Ui, app: &mut HyperionApp, stick: Stick) {
+/// The RC-filter sub-section for one stick, reused as a sub-panel by the Sticks screen
+/// (`DESIGN-REMAP.md` §8: "the existing RC panel reused verbatim as the `rc` sub-section").
+///
+/// `rc_mode_on` selects the RC stage for this stick (C# `StickAlgorithmMode == RC`); the RC
+/// parameter controls below are only meaningful when it is on. Any change re-sends the whole
+/// [`hyperion_core::stick::settings::StickSettings`] for the stick.
+pub fn rc_controls(ui: &mut egui::Ui, app: &mut HyperionApp, stick: Stick) {
     let id = match stick {
         Stick::Left => "ls",
         Stick::Right => "rs",
     };
+
+    // RC stage selector (replaces the M2 StickMode combo: RC is now one stage among many).
+    let mut rc_mode_on = app.mirror_mut().stick(stick).rc_mode_on;
+    if ui
+        .checkbox(&mut rc_mode_on, "RC filter stage enabled")
+        .changed()
+    {
+        app.mirror_mut().stick_mut(stick).rc_mode_on = rc_mode_on;
+        app.push_stick_settings(stick);
+    }
+
+    // The RC parameter controls are only meaningful when the RC stage is selected.
+    ui.add_enabled_ui(rc_mode_on, |ui| {
+        rc_params(ui, app, stick, id);
+    });
+}
+
+/// The RC-filter parameter controls for one stick. Any change re-sends the whole `StickSettings`.
+fn rc_params(ui: &mut egui::Ui, app: &mut HyperionApp, stick: Stick, id: &str) {
     // Work on a local copy of the mirror's RC so the borrow of `app` is short; write back +
     // notify only if something changed.
     let mut rc = app.mirror_mut().stick(stick).rc;
@@ -94,7 +97,7 @@ fn rc_controls(ui: &mut egui::Ui, app: &mut HyperionApp, stick: Stick) {
 
     if changed {
         app.mirror_mut().stick_mut(stick).rc = rc;
-        app.push_rc(stick);
+        app.push_stick_settings(stick);
     }
 }
 
@@ -175,7 +178,7 @@ fn curve_preview(ui: &mut egui::Ui, id: &str, curve: &hyperion_core::rc::RcCurve
     let _ = id;
 }
 
-/// The global threading + HidHide policy panel.
+/// The global threading + HidHide policy panel (the Engine tab).
 pub fn global_panel(ui: &mut egui::Ui, app: &mut HyperionApp) {
     ui.heading("Engine policy");
 
@@ -257,14 +260,6 @@ pub fn global_panel(ui: &mut egui::Ui, app: &mut HyperionApp) {
                 app.push_hidhide();
             }
         });
-}
-
-/// Display label for a [`StickMode`].
-fn mode_label(mode: StickMode) -> &'static str {
-    match mode {
-        StickMode::None => "None (pass-through)",
-        StickMode::Rc => "RC filter",
-    }
 }
 
 /// Display label for an [`RcMode`].

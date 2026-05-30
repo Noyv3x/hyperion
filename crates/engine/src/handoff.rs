@@ -1,6 +1,6 @@
 //! Lock-free handoffs between the hot thread and the control plane (`DESIGN.md` §6).
 //!
-//! Three primitives, each chosen for a specific direction and never a `Mutex`:
+//! Four primitives, each chosen for a specific direction and never a `Mutex`:
 //!
 //! * **Config (GUI/supervisor → HOT):** [`ConfigHandle`] = `Arc<ArcSwap<EngineConfig>>`.
 //!   The hot loop `load()`s wait-free once per report; the config store `store()`s a whole new
@@ -12,11 +12,18 @@
 //!   `Sync`, so a single shared producer across two threads is unsound (resolved conflict #6).
 //!   Each control thread owns its own [`CommandTx`]; the hot loop drains both halves of
 //!   [`CommandRx`] every report.
+//! * **KBM egress (HOT → injector):** a **third** SPSC `rtrb` ring [`KbmTx`] / [`KbmRx`] of a
+//!   `Copy` [`KbmBatch`] (blueprint §7.3). The hot loop `push`es one batch per KBM-producing
+//!   report, **non-blocking, drop-on-full** (never wedges the hot thread); a normal-priority
+//!   `KbmInjector` thread (in `kbm-output`) drains it and realizes the edges via `SendInput`.
+//!   `KbmBatch` is a fixed-capacity `Copy` value (verifier latency FIX 4) so the ring element
+//!   and the hot-thread push memcpy are bounded.
 
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hyperion_core::config::EngineConfig;
+use hyperion_core::output::KbmBatch;
 
 use crate::telemetry::TelemetryFrame;
 
@@ -24,6 +31,13 @@ use crate::telemetry::TelemetryFrame;
 /// so a small fixed ring is plenty; a full queue means the hot loop is wedged, which other
 /// telemetry would already surface.
 pub const COMMAND_QUEUE_CAP: usize = 64;
+
+/// Capacity of the SPSC KBM egress ring (HOT → injector). One [`KbmBatch`] per report; the
+/// injector drains at normal priority. Sized to absorb a brief injector stall (GC-free, but the
+/// OS may deschedule it) without back-pressuring the hot thread — on overflow the hot loop drops
+/// the batch (surfaced as a telemetry counter), never blocks. A few dozen reports of slack at a
+/// 4 kHz report rate is a handful of milliseconds, far longer than any sane injector hiccup.
+pub const KBM_QUEUE_CAP: usize = 256;
 
 /// Wait-free config snapshot shared GUI/supervisor → HOT.
 ///
@@ -82,19 +96,66 @@ impl CommandRx {
     }
 }
 
+/// The hot side of the KBM egress ring: the producer of [`KbmBatch`]es to the injector thread.
+///
+/// Owned by the hot loop. [`push`](KbmTx::push) is non-blocking and **drop-on-full**: a wedged
+/// injector must never stall the TIME_CRITICAL hot thread, so an over-capacity batch is dropped
+/// (the hot loop surfaces it as a telemetry counter, like dropped/duplicate reports).
+pub struct KbmTx(pub rtrb::Producer<KbmBatch>);
+
+impl KbmTx {
+    /// Enqueue one report's KBM edges. Returns `false` if the ring is full (the batch was
+    /// dropped); never blocks, never allocates. The hot loop should only call this when the
+    /// batch is non-empty so a zero-edge report costs nothing.
+    #[inline]
+    pub fn push(&mut self, batch: KbmBatch) -> bool {
+        self.0.push(batch).is_ok()
+    }
+}
+
+/// The injector side of the KBM egress ring: the consumer of [`KbmBatch`]es.
+///
+/// Owned by the `KbmInjector` thread (in `kbm-output`, `cfg(windows)`). It [`pop`](KbmRx::pop)s
+/// each batch and realizes the edges via one batched `SendInput`; macro playback timing (the
+/// unbounded part) lives entirely on that thread, never the hot thread.
+pub struct KbmRx(pub rtrb::Consumer<KbmBatch>);
+
+impl KbmRx {
+    /// Pop the next pending batch, or `None` if the ring is empty. Non-blocking; call in a loop
+    /// to fully drain. Returns `None` once the producer is dropped *and* the ring is drained.
+    #[inline]
+    pub fn pop(&mut self) -> Option<KbmBatch> {
+        self.0.pop().ok()
+    }
+
+    /// Whether the producer (the hot thread's [`KbmTx`]) has been dropped and the ring is empty,
+    /// so no further batch will ever arrive — the injector loop's clean exit condition.
+    #[inline]
+    pub fn is_abandoned(&self) -> bool {
+        self.0.is_abandoned() && self.0.is_empty()
+    }
+}
+
+/// All hot-path handoff links returned by [`build_links`]: the shared config handle, the
+/// telemetry pair, the command triple (two SPSC producers + one hot consumer), and the KBM
+/// egress pair. Aliased so the (intentionally wide) tuple does not trip `clippy::type_complexity`.
+pub type EngineLinks = (
+    ConfigHandle,
+    (TelemetryTx, TelemetryRx),
+    (CommandTx, CommandTx, CommandRx),
+    (KbmTx, KbmRx),
+);
+
 /// Build all hot-path handoff links from an initial config snapshot.
 ///
 /// Returns:
 /// * the shared [`ConfigHandle`] (clone for each publisher; the hot loop holds one),
 /// * the telemetry pair `(TelemetryTx /*hot*/, TelemetryRx /*gui*/)`,
-/// * the command triple `(CommandTx /*gui*/, CommandTx /*supervisor*/, CommandRx /*hot*/)`.
-pub fn build_links(
-    cfg: EngineConfig,
-) -> (
-    ConfigHandle,
-    (TelemetryTx, TelemetryRx),
-    (CommandTx, CommandTx, CommandRx),
-) {
+/// * the command triple `(CommandTx /*gui*/, CommandTx /*supervisor*/, CommandRx /*hot*/)`,
+/// * the KBM egress pair `(KbmTx /*hot*/, KbmRx /*injector*/)` — the third SPSC ring (§7.3).
+///
+/// The two-SPSC-command topology is unchanged; the KBM ring is purely additive.
+pub fn build_links(cfg: EngineConfig) -> EngineLinks {
     let config = Arc::new(ArcSwap::from_pointee(cfg));
 
     let (tele_in, tele_out) = triple_buffer::triple_buffer(&TelemetryFrame::default());
@@ -111,7 +172,10 @@ pub fn build_links(
         },
     );
 
-    (config, telemetry, commands)
+    let (kbm_tx, kbm_rx) = rtrb::RingBuffer::new(KBM_QUEUE_CAP);
+    let kbm = (KbmTx(kbm_tx), KbmRx(kbm_rx));
+
+    (config, telemetry, commands, kbm)
 }
 
 #[cfg(test)]
@@ -121,7 +185,7 @@ mod tests {
     #[test]
     fn two_producers_both_drain_on_one_consumer() {
         let cfg = EngineConfig::default();
-        let (_config, _telemetry, (mut gui_tx, mut sup_tx, mut rx)) = build_links(cfg);
+        let (_config, _telemetry, (mut gui_tx, mut sup_tx, mut rx), _kbm) = build_links(cfg);
 
         // GUI and supervisor each push through their OWN producer (the soundness fix: no
         // shared rtrb::Producer across threads).
@@ -144,7 +208,7 @@ mod tests {
     #[test]
     fn full_queue_returns_command_without_panicking() {
         let cfg = EngineConfig::default();
-        let (_config, _telemetry, (mut gui_tx, _sup_tx, _rx)) = build_links(cfg);
+        let (_config, _telemetry, (mut gui_tx, _sup_tx, _rx), _kbm) = build_links(cfg);
         // Fill the GUI queue until it reports back-pressure (capacity is at least one).
         let mut accepted = 0usize;
         loop {
@@ -167,7 +231,7 @@ mod tests {
     #[test]
     fn arcswap_load_then_store_observed_by_reader() {
         let cfg = EngineConfig::default();
-        let (config, _telemetry, _commands) = build_links(cfg);
+        let (config, _telemetry, _commands, _kbm) = build_links(cfg);
 
         // A wait-free "hot side" load sees the initial snapshot; clone it to a fresh `Arc`
         // (pointer identity differs from the live one).
@@ -185,7 +249,7 @@ mod tests {
     #[test]
     fn telemetry_write_read_round_trip() {
         let cfg = EngineConfig::default();
-        let (_config, (mut tx, mut rx), _commands) = build_links(cfg);
+        let (_config, (mut tx, mut rx), _commands, _kbm) = build_links(cfg);
         let frame = TelemetryFrame {
             dropped: 7,
             dt_us: 250.0,
@@ -195,5 +259,48 @@ mod tests {
         let got = *rx.0.read();
         assert_eq!(got.dropped, 7);
         assert_eq!(got.dt_us, 250.0);
+    }
+
+    #[test]
+    fn kbm_ring_pushes_pop_in_order_and_drops_on_full() {
+        let cfg = EngineConfig::default();
+        let (_config, _telemetry, _commands, (mut kbm_tx, mut kbm_rx)) = build_links(cfg);
+
+        // A batch carrying one key edge round-trips through the ring intact.
+        let mut batch = KbmBatch::new();
+        batch.push(hyperion_core::output::KbmEvent::Key {
+            vk: 0x41,
+            down: true,
+            kind: hyperion_core::output::KeyKind::ScanCode,
+        });
+        assert!(kbm_tx.push(batch), "first push accepted");
+        let got = kbm_rx.pop().expect("one batch available");
+        assert_eq!(got.as_slice().len(), 1);
+        assert!(kbm_rx.pop().is_none(), "ring drained");
+
+        // Fill to capacity, then confirm an over-cap push is dropped (never blocks/panics).
+        let mut accepted = 0usize;
+        loop {
+            if kbm_tx.push(KbmBatch::new()) {
+                accepted += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(accepted, KBM_QUEUE_CAP, "ring accepts exactly its capacity");
+        assert!(!kbm_tx.push(KbmBatch::new()), "drop-on-full, no block");
+    }
+
+    #[test]
+    fn kbm_ring_reports_abandoned_after_producer_drop() {
+        let cfg = EngineConfig::default();
+        let (_config, _telemetry, _commands, (kbm_tx, mut kbm_rx)) = build_links(cfg);
+        assert!(!kbm_rx.is_abandoned(), "live producer is not abandoned");
+        drop(kbm_tx);
+        assert!(
+            kbm_rx.is_abandoned(),
+            "dropped producer + empty ring is the injector's clean-exit signal"
+        );
+        assert!(kbm_rx.pop().is_none());
     }
 }

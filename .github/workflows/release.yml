@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build + publish (windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}"    >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --release -p app
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "hyperion_${{ steps.ver.outputs.version }}_x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/hyperion.exe $stage/
+          Copy-Item config.toml $stage/
+          Copy-Item USAGE.md    $stage/
+          Copy-Item README.md   $stage/
+          Copy-Item LICENSE     $stage/
+          Copy-Item NOTICE.md   $stage/
+          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip" -Force
+          echo "ASSET=$stage.zip" >> $env:GITHUB_ENV
+
+      - name: Create / update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --title "Hyperion $TAG" \
+              --notes "Automated Windows x64 build. Requires ViGEmBus (and optionally HidHide) installed. See USAGE.md inside the zip for setup and hardware bring-up."
+          gh release upload "$TAG" "$ASSET" --clobber

@@ -1,0 +1,49 @@
+# Hyperion config — placed next to hyperion.exe. The egui GUI edits this live
+# (Save writes it back); you can also hand-edit it. Values are clamped on load.
+
+# Which [devices.*] profile is active.
+active_device = "dse_primary"
+
+[thread]
+# hot_core / gui_core: pin threads to physical cores (omit = auto; avoid SMT siblings).
+# hot_core = 2
+# gui_core = 4
+timer_resolution_us = 500       # NtSetTimerResolution target (0.5 ms)
+use_mmcss = true                # MMCSS "Pro Audio" boost on the hot thread
+mmcss_task = "Pro Audio"
+wait_mode = "HybridSpin"        # "Blocking" (lowest CPU) | "HybridSpin" (lowest latency)
+spin_budget_us = 80             # HybridSpin: spin this long before a real blocking wait
+skip_duplicate_reports = false  # skip byte-identical duplicate reports (fake-4K)
+dt_source = "QpcOnly"           # "QpcOnly" (safe default) | "DeviceTimestamp" (after HW calibration)
+
+[hidhide]
+enabled = true                  # hide the physical pad so the game sees only the virtual one
+use_cli = true                  # use HidHideCLI.exe (the working path); IOCTL path is WIP
+cli_path = 'C:\Program Files\Nefarius Software Solutions\HidHide\x64\HidHideCLI.exe'
+
+# ---- Device profile: DualSense Edge over USB (PID 0x0DF2; base DualSense = 0x0CE6) ----
+[devices.dse_primary]
+vid = 0x054C
+pid = 0x0DF2
+report_rate_hz = 4000
+stick_bits = 8
+
+[devices.dse_primary.ls]
+mode = "Rc"                     # "None" | "Rc"
+[devices.dse_primary.ls.rc]
+enabled = true
+mode = "UltimateDt"             # "FireBirdInteger" | "UltimateLegacy" | "UltimateDt" (default)
+use_dynamic_curve = false
+period_us = 4000                # [1000, 8000]; a TRUE time constant in UltimateDt
+fixed_param = 100               # [-500, 500]; >0 smooth/low-pass, <0 lead/fast-follow, 0 bypass
+curve = { y0 = 100, x1 = 32, y1 = 100, x2 = 96, y2 = 100, y3 = 100 }
+
+[devices.dse_primary.rs]
+mode = "Rc"
+[devices.dse_primary.rs.rc]
+enabled = true
+mode = "UltimateDt"
+use_dynamic_curve = false
+period_us = 4000
+fixed_param = 100
+curve = { y0 = 100, x1 = 32, y1 = 100, x2 = 96, y2 = 100, y3 = 100 }

@@ -17,7 +17,7 @@ use hyperion_core::input::seq::SeqTracker;
 use hyperion_core::input::{Buttons, InputSample, SourceMeta};
 
 use crate::win::enumerate::DeviceFilter;
-use crate::win::hid::{OverlappedReader, WaitMode};
+use crate::win::hid::{OverlappedReader, WaitMode, HID_REPORT_LEN};
 use crate::{DeviceId, DeviceSource, SourceError};
 
 /// A DualSense (or DualSense Edge) USB device exposed as a [`DeviceSource`].
@@ -62,15 +62,28 @@ impl DeviceSource for DualSenseUsbSource {
 
     fn next_sample(&mut self, out: &mut InputSample) -> Result<bool, SourceError> {
         // Single outstanding overlapped read, double-buffered (DESIGN §6). The just-completed
-        // buffer is parsed through the core seam; a benign timeout yields `Ok(false)`.
+        // buffer is parsed through the core seam; a benign timeout yields `Ok(false)`. The host
+        // QPC timestamp is the one captured by the reader at read completion.
         //
-        // TODO(hardware): supply the real host QPC timestamp captured at completion
-        // (`QueryPerformanceCounter` → ns). Stubbed to 0 until the overlapped read lands.
-        let qpc_ns: u64 = 0;
-        match self.reader.read_completed()? {
-            Some(buf) => Ok(parse_into(buf, out, &mut self.clock, &mut self.seq, qpc_ns)),
-            None => Ok(false),
-        }
+        // The completed report is copied into a small stack buffer so the immutable borrow of
+        // `self.reader` ends before `parse_into` takes `&mut self.clock`/`&mut self.seq` — the
+        // copy is a fixed 64 bytes, off the hot path's allocation budget.
+        let (report, qpc_ns) = match self.reader.read_completed()? {
+            Some(buf) => {
+                let mut report = [0u8; HID_REPORT_LEN];
+                let n = buf.len().min(HID_REPORT_LEN);
+                report[..n].copy_from_slice(&buf[..n]);
+                (report, self.reader.last_qpc_ns())
+            }
+            None => return Ok(false),
+        };
+        Ok(parse_into(
+            &report,
+            out,
+            &mut self.clock,
+            &mut self.seq,
+            qpc_ns,
+        ))
     }
 
     fn device_id(&self) -> DeviceId {
@@ -117,4 +130,71 @@ pub fn parse_into(
     out.dt_us = dt_us;
     out.host_qpc_ns = qpc_ns;
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperion_core::input::ds_report::{DS_USB_REPORT_ID, DS_USB_REPORT_LEN};
+
+    /// Build a minimal valid DS USB report 0x01 with the given stick/trigger/counter/timestamp.
+    fn synth_report(lx: u8, ry: u8, l2: u8, counter6: u8, ts: u16) -> [u8; HID_REPORT_LEN] {
+        let mut b = [0u8; HID_REPORT_LEN];
+        b[0] = DS_USB_REPORT_ID;
+        b[1] = lx; // LX
+        b[2] = 0x80; // LY centered
+        b[3] = 0x80; // RX centered
+        b[4] = ry; // RY
+        b[8] = l2; // L2 analog
+        b[7] = counter6 << 2; // byte-7 high 6 bits are the frame counter
+        b[10] = (ts & 0xFF) as u8; // sensor ts low
+        b[11] = (ts >> 8) as u8; // sensor ts high
+        b
+    }
+
+    #[test]
+    fn parse_into_decodes_synthetic_report_through_core() {
+        // Drives the I/O->core seam with an injected buffer (no device): asserts the core
+        // parser populated the sample, exercising offsets, the dt fold, and seq accounting.
+        assert_eq!(DS_USB_REPORT_LEN, HID_REPORT_LEN);
+
+        let mut clock = SensorClock::default();
+        let mut seq = SeqTracker::default();
+        let mut out = InputSample::default();
+
+        // Priming report: dt is 0.0 on the first fold, seq starts the tracker.
+        let first = synth_report(0x00, 0x00, 0xFF, 5, 100);
+        let ok = parse_into(&first, &mut out, &mut clock, &mut seq, 1_000);
+        assert!(ok, "valid report 0x01 must decode");
+        assert_eq!(out.seq, 5);
+        assert_eq!(out.host_qpc_ns, 1_000);
+        assert_eq!(out.dt_us, 0.0, "first fold primes the clock");
+        // LX raw 0x00 maps to the canonical left extreme (-1.0); RY raw 0x00 -> +1.0 (up).
+        assert!(out.left.x < -0.99);
+        assert!(out.right.y > 0.99);
+        assert!(out.r2 < 0.01 && out.l2 > 0.99, "triggers map through /255");
+
+        // Second report one counter later: a real positive dt and no drop.
+        let second = synth_report(0x80, 0x80, 0x00, 6, 200);
+        let ok = parse_into(&second, &mut out, &mut clock, &mut seq, 2_000);
+        assert!(ok);
+        assert_eq!(out.seq, 6);
+        assert_eq!(out.dropped, 0);
+        assert!(!out.is_duplicate);
+        assert!(out.dt_us > 0.0, "second fold yields a real elapsed dt");
+    }
+
+    #[test]
+    fn parse_into_rejects_wrong_report_id() {
+        let mut clock = SensorClock::default();
+        let mut seq = SeqTracker::default();
+        let mut out = InputSample::default();
+
+        let mut buf = synth_report(0x40, 0x40, 0x10, 1, 50);
+        buf[0] = 0x31; // not the DS4-compatible report 0x01
+        assert!(!parse_into(&buf, &mut out, &mut clock, &mut seq, 0));
+
+        let short = [DS_USB_REPORT_ID; 10]; // shorter than DS_USB_REPORT_LEN
+        assert!(!parse_into(&short, &mut out, &mut clock, &mut seq, 0));
+    }
 }

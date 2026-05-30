@@ -14,14 +14,28 @@
 //! Because the submit is synchronous and runs on the `TIME_CRITICAL` hot thread, the wrapper must
 //! guarantee a non-blocking/bounded submit so the driver can never stall that thread (DESIGN §6).
 //!
-//! On non-Windows targets the whole crate compiles to nothing (`#![cfg(windows)]`). In M1 the
-//! ViGEmBus driver calls are bring-up stubs (`TODO(hardware)`), but the [`VirtualPad`] trait, the
-//! [`Vigem360Pad`] target, and the f64→i16 mapping into [`XusbReport`] are real and final.
+//! ## Submit latency model (DESIGN §6 / §8)
+//!
+//! [`Vigem360Pad::update`] performs exactly one `IOCTL_XUSB_SUBMIT_REPORT` per call. The
+//! underlying `vigem-rust` crate issues that IOCTL with an `OVERLAPPED` and then waits on the
+//! event with `GetOverlappedResult(..., bWait = true)`, so the call returns only when the driver
+//! has *acknowledged the single submit*. There is **no internal queue**: the call is bounded by
+//! the driver's completion of one report, not by any backlog. It is therefore a synchronous,
+//! bounded round-trip — never an unbounded block on a producer/consumer queue. The hot loop must
+//! still treat it as a syscall (run it on the thread it owns), because a faulted/removed driver
+//! could in principle delay the IOCTL completion. // HW-verify: tail latency of one
+//! `IOCTL_XUSB_SUBMIT_REPORT` round-trip under load is hardware/driver-dependent.
+//!
+//! On non-Windows targets the whole crate compiles to nothing (`#![cfg(windows)]`).
 #![cfg(windows)]
 
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use hyperion_core::output::{to_xinput_thumb, to_xinput_trigger, OutputFrame};
+use vigem_rust::target::Xbox360;
+use vigem_rust::{Client, TargetHandle, X360Button, X360Report};
 
 /// A virtual gamepad target the engine can plug in and drive.
 pub trait VirtualPad {
@@ -62,12 +76,19 @@ impl std::error::Error for OutErr {}
 /// only place f64 → these integers happens.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XusbReport {
+    /// XInput digital-button bitmask (already packed by the core pipeline).
     pub buttons: u16,
+    /// Left trigger, 0–255.
     pub left_trigger: u8,
+    /// Right trigger, 0–255.
     pub right_trigger: u8,
+    /// Left thumbstick X, -32768..=32767 (0 = center).
     pub thumb_lx: i16,
+    /// Left thumbstick Y, -32768..=32767 (0 = center).
     pub thumb_ly: i16,
+    /// Right thumbstick X, -32768..=32767 (0 = center).
     pub thumb_rx: i16,
+    /// Right thumbstick Y, -32768..=32767 (0 = center).
     pub thumb_ry: i16,
 }
 
@@ -88,21 +109,42 @@ impl XusbReport {
     }
 }
 
-/// A virtual Xbox 360 controller backed by ViGEmBus.
+impl From<XusbReport> for X360Report {
+    /// Lay out a quantized [`XusbReport`] into the wire `X360Report` ViGEmBus consumes.
+    ///
+    /// `buttons` is passed through with `from_bits_retain` so the already-packed XInput
+    /// bitmask survives verbatim even if a future XInput bit is not a named `X360Button`
+    /// flag — the core pipeline owns the packing, this crate only carries it.
+    #[inline]
+    fn from(r: XusbReport) -> Self {
+        X360Report {
+            buttons: X360Button::from_bits_retain(r.buttons),
+            left_trigger: r.left_trigger,
+            right_trigger: r.right_trigger,
+            thumb_lx: r.thumb_lx,
+            thumb_ly: r.thumb_ly,
+            thumb_rx: r.thumb_rx,
+            thumb_ry: r.thumb_ry,
+        }
+    }
+}
+
+/// A virtual Xbox 360 controller backed by ViGEmBus, via the pure-Rust `vigem-rust` FFI wrapper.
 ///
-/// Holds the ViGEm client/bus connection and the Xbox 360 target. The handle fields are stored
-/// os-agnostically for M1 (no `vigem`/`windows` crate linked yet — DESIGN §12 M1); the real types
-/// are the `vigem` wrapper's `Client` and `Xbox360Target`. `TODO(hardware)`: replace with the
-/// typed handles and free them in [`VirtualPad::unplug`] / `Drop`.
+/// Holds the ViGEm [`Client`] (bus connection) and, once plugged, the
+/// [`TargetHandle<Xbox360>`]. The handle unplugs the pad on drop, and dropping the [`Client`]
+/// unplugs every target it owns, so [`Drop`] is sufficient cleanup; [`VirtualPad::unplug`] is
+/// the explicit form.
 #[derive(Default)]
 pub struct Vigem360Pad {
-    /// ViGEmBus client/bus connection handle (raw, M1 placeholder).
-    client: usize,
-    /// Xbox 360 target handle (raw, M1 placeholder).
-    target: usize,
-    /// Whether the target is plugged in and enumerated by the OS.
+    /// ViGEmBus client / bus connection. `None` until [`VirtualPad::plugin`] connects it.
+    client: Option<Client>,
+    /// The plugged-in Xbox 360 target. `None` until [`VirtualPad::plugin`] adds it.
+    target: Option<TargetHandle<Xbox360>>,
+    /// Whether the target is plugged in *and* enumerated by the OS (set by
+    /// [`VirtualPad::wait_ready`]).
     ready: bool,
-    /// The last report submitted, retained for telemetry/debug and to avoid redundant IOCTLs.
+    /// The last report submitted, retained for telemetry/debug and to skip redundant IOCTLs.
     last_report: XusbReport,
 }
 
@@ -122,43 +164,87 @@ impl Vigem360Pad {
 
 impl VirtualPad for Vigem360Pad {
     fn plugin(&mut self) -> Result<(), OutErr> {
-        // TODO(hardware): `vigem_alloc()` + `vigem_connect()` for the client, then
-        // `vigem_target_x360_alloc()` + `vigem_target_add()` to plug the Xbox 360 target.
-        let _ = (&mut self.client, &mut self.target);
-        Err(OutErr::Driver(
-            "ViGEmBus bring-up pending (no driver linked in M1)".to_owned(),
-        ))
+        // Connect to ViGEmBus (open the bus device), then create + add the Xbox 360 target.
+        // `vigem-rust` is a safe wrapper: the unsafe Win32 FFI lives inside the crate, so there
+        // is no `unsafe` block to guard here. Both calls map driver failures into OutErr::Driver.
+        let client = Client::connect().map_err(|e| OutErr::Driver(e.to_string()))?;
+        let target = client
+            .new_x360_target()
+            .plugin()
+            .map_err(|e| OutErr::Driver(e.to_string()))?;
+        self.client = Some(client);
+        self.target = Some(target);
+        self.ready = false;
+        Ok(())
     }
 
     fn wait_ready(&mut self, timeout: Duration) -> Result<(), OutErr> {
-        // TODO(hardware): poll target state / wait on the add notification until the OS enumerates
-        // the pad or `timeout` elapses; set `self.ready = true` on success.
-        let _ = timeout;
-        if self.target == 0 {
-            return Err(OutErr::NotReady);
+        let target = self.target.as_ref().ok_or(OutErr::NotReady)?;
+
+        // `vigem-rust`'s `wait_for_ready()` blocks on its own enumeration-stabilization heuristic
+        // (first notification within ~500 ms, then waits for 250 ms of notification silence) and
+        // takes no timeout argument. The trait contract is a caller-supplied outer bound, so run
+        // the blocking wait on a helper thread and bound it with `timeout`. `TargetHandle` is
+        // `Clone` (Arc-backed), so the helper holds its own handle and the pad keeps using ours.
+        let handle = target.clone();
+        let (tx, rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = tx.send(handle.wait_for_ready());
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(())) => {
+                // Reap the helper; it has already finished (it sent before returning).
+                let _ = join.join();
+                self.ready = true;
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                let _ = join.join();
+                Err(OutErr::Driver(e.to_string()))
+            }
+            // Outer bound elapsed: the device is not enumerated yet. Detach the helper thread; it
+            // will complete its (bounded, ~ sub-second) wait and exit on its own. Leave `ready`
+            // false so `update` keeps returning NotReady until a later `wait_ready` succeeds.
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(OutErr::NotReady),
+            // The worker panicked / dropped the sender without sending — treat as driver failure.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = join.join();
+                Err(OutErr::Driver(
+                    "wait_for_ready worker disconnected before signalling readiness".to_owned(),
+                ))
+            }
         }
-        self.ready = true;
-        Ok(())
     }
 
     fn update(&mut self, f: &OutputFrame) -> Result<(), OutErr> {
         if !self.ready {
             return Err(OutErr::NotReady);
         }
+        let target = self.target.as_ref().ok_or(OutErr::NotReady)?;
+
         // The single final quantization: f64 OutputFrame -> i16/u8 XUSB report.
         let report = XusbReport::from_frame(f);
+
+        // One synchronous, bounded IOCTL (IOCTL_XUSB_SUBMIT_REPORT). No internal queue: the call
+        // returns when the driver acknowledges this single report (see the module-level submit
+        // latency model). On driver error, surface it without flipping `ready` — a transient
+        // submit failure is reported to the caller, which owns the recovery policy (DESIGN §6).
+        target
+            .update(&report.into())
+            .map_err(|e| OutErr::Driver(e.to_string()))?;
+
         self.last_report = report;
-        // TODO(hardware): `vigem_target_x360_update(client, target, &xusb_report)` — one
-        // synchronous, bounded `DeviceIoControl`. Must never block the TIME_CRITICAL hot thread.
         Ok(())
     }
 
     fn unplug(&mut self) {
-        // TODO(hardware): `vigem_target_remove()` + free target + `vigem_disconnect()`/free client.
-        // No-op safe in M1 (no real handles held).
+        // Dropping the target handle unplugs the pad from the bus; dropping the client closes the
+        // bus connection (and unplugs any remaining targets it owns). Order: target first, then
+        // client. Both are RAII in `vigem-rust`, so explicit teardown is just dropping them.
         self.ready = false;
-        self.target = 0;
-        self.client = 0;
+        self.target = None;
+        self.client = None;
     }
 }
 

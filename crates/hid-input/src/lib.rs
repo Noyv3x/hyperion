@@ -10,8 +10,11 @@
 //! On non-Windows targets the entire crate compiles to nothing (`#![cfg(windows)]`), so the
 //! workspace still builds and `hyperion_core` stays unit-tested on Linux CI. The public
 //! surface here (the [`DeviceSource`] trait, [`SourceError`], [`DeviceId`], and the three
-//! backends) is final per DESIGN §6/§7; the actual Win32 read/enumerate bodies are M1
-//! bring-up stubs marked `TODO(hardware)`.
+//! backends) is final per DESIGN §6/§7. The DualSense USB path (enumeration + overlapped
+//! double-buffered `ReadFile`) and the XInput fallback are implemented against the typed
+//! `windows` Win32 bindings; the generic raw-HID field decode stays a layout-driven skeleton
+//! until a real report descriptor is supplied. Anything that can only be validated against
+//! physical hardware is flagged with a `// HW-verify` note.
 #![cfg(windows)]
 
 use hyperion_core::input::{InputSample, SourceMeta};

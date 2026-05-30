@@ -1,11 +1,12 @@
 //! The hot loop (Windows only). Owns one HID device, runs the `core` RC filter in place, and
 //! submits to the virtual pad inline — zero-alloc, lock-free steady state (`DESIGN.md` §6).
 //!
-//! # Skeleton status (M1)
+//! # Wiring (M1)
 //! The **control flow and the types are real**; the actual blocking HID read and the ViGEm
-//! IOCTL are driven through the [`DeviceSource`] / [`VirtualPad`] traits below, which the
-//! `hid-input` and `vgamepad-output` crates implement on Windows. MMCSS / affinity policy
-//! binding and HidHide live in the supervisor and are filled in during hardware bring-up.
+//! IOCTL are driven through the [`DeviceSource`] / [`VirtualPad`] traits below. On Windows the
+//! [`crate::win_io`] adapters implement these traits over the `hid-input` `DualSenseUsbSource`
+//! and `vgamepad-output` `Vigem360Pad` backends; MMCSS / affinity policy binding and HidHide
+//! live in the supervisor. The Win32 bodies inside the backends are validated on hardware.
 //!
 //! The engine is written **generically over two traits** expressed entirely in terms of
 //! [`hyperion_core`] value types ([`HotInput`], [`OutputFrame`]). That keeps the hot loop

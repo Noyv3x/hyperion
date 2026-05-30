@@ -14,5 +14,10 @@ path = "src/main.rs"
 [dependencies]
 engine = { path = "../engine" }
 
+# Ctrl-C handling is only wired on the Windows headless runtime; the non-Windows build is a
+# pure compile check and never touches it, so keep the dep off that target.
+[target.'cfg(windows)'.dependencies]
+ctrlc = "3"
+
 [lints]
 workspace = true

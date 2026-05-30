@@ -6,8 +6,12 @@
 //! a QPC-only dt (there is no device timestamp). It exists so *some* pad always works; it is not
 //! a latency path (DESIGN §7).
 
-use hyperion_core::input::{InputSample, SourceMeta};
+use hyperion_core::input::normalize::{signed16_to_axis, u8_trigger};
+use hyperion_core::input::{Buttons, InputSample, SourceMeta};
+use windows::Win32::Foundation::{ERROR_DEVICE_NOT_CONNECTED, ERROR_SUCCESS};
+use windows::Win32::UI::Input::XboxController::{XInputGetState, XINPUT_STATE};
 
+use crate::win::qpc_now_ns;
 use crate::{DeviceId, DeviceSource, SourceError};
 
 /// An XInput user index in `0..=3`.
@@ -47,19 +51,52 @@ impl DeviceSource for XInputSource {
     }
 
     fn next_sample(&mut self, out: &mut InputSample) -> Result<bool, SourceError> {
-        // TODO(hardware): `XInputGetState(user_index, &mut state)`; on `ERROR_DEVICE_NOT_CONNECTED`
-        // return `Err(SourceError::Disconnected)`. If `state.dwPacketNumber == last_packet`,
-        // nothing changed → `Ok(false)`. Otherwise advance `synth_seq`, compute QPC-only dt from
-        // `prev_qpc_ns`, map i16 thumbs (lossless) + u8 triggers (/255) into `out`, store the
-        // packet number, and return `Ok(true)`.
-        let _ = (
-            self.user_index,
-            &mut self.synth_seq,
-            &mut self.prev_qpc_ns,
-            &mut self.last_packet,
-            &mut *out,
-        );
-        Ok(false)
+        let mut state = XINPUT_STATE::default();
+        // SAFETY: `user_index` is validated to `0..=3` in `open`; `&mut state` is an owned
+        // out-struct. `XInputGetState` returns a raw Win32 error code rather than throwing.
+        let rc = unsafe { XInputGetState(self.user_index, &mut state) };
+        if rc == ERROR_DEVICE_NOT_CONNECTED.0 {
+            return Err(SourceError::Disconnected);
+        }
+        if rc != ERROR_SUCCESS.0 {
+            return Err(SourceError::Io(std::io::Error::from_raw_os_error(
+                rc as i32,
+            )));
+        }
+        // `dwPacketNumber` is monotonic and only changes when the state actually changes;
+        // an unchanged packet is a benign "no new input" poll.
+        if state.dwPacketNumber == self.last_packet {
+            return Ok(false);
+        }
+
+        // QPC-only dt: XInput exposes no device timestamp, so elapsed time is purely host-side.
+        // The priming poll (`prev_qpc_ns == 0`) yields `dt_us == 0.0`.
+        let now = qpc_now_ns();
+        let dt_us = if self.prev_qpc_ns == 0 {
+            0.0
+        } else {
+            now.saturating_sub(self.prev_qpc_ns) as f64 / 1_000.0
+        };
+        self.prev_qpc_ns = now;
+        self.last_packet = state.dwPacketNumber;
+        self.synth_seq = self.synth_seq.wrapping_add(1);
+
+        let pad = &state.Gamepad;
+        // XInput thumbsticks are already `+y == up`, matching the canonical frame; map losslessly.
+        out.left.x = signed16_to_axis(pad.sThumbLX);
+        out.left.y = signed16_to_axis(pad.sThumbLY);
+        out.right.x = signed16_to_axis(pad.sThumbRX);
+        out.right.y = signed16_to_axis(pad.sThumbRY);
+        out.l2 = u8_trigger(pad.bLeftTrigger);
+        out.r2 = u8_trigger(pad.bRightTrigger);
+        // Carry the XInput digital button mask opaquely in the low 16 bits.
+        out.buttons = Buttons(u32::from(pad.wButtons.0));
+        out.seq = self.synth_seq;
+        out.dropped = 0;
+        out.is_duplicate = false;
+        out.dt_us = dt_us;
+        out.host_qpc_ns = now;
+        Ok(true)
     }
 
     fn device_id(&self) -> DeviceId {

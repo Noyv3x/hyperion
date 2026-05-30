@@ -10,5 +10,33 @@ authors.workspace = true
 [dependencies]
 hyperion-core = { path = "../core" }
 
+# Typed Win32 bindings. Only the modules the HID shell actually touches are enabled;
+# a wrong/over-broad feature set is the #1 build failure for this crate, so the list is
+# kept minimal and each entry maps to a function family used below:
+#   Win32_Foundation                              -> HANDLE, CloseHandle, GENERIC_*, WIN32_ERROR, WAIT_EVENT
+#   Win32_Devices_DeviceAndDriverInstallation     -> SetupDi* enumeration
+#   Win32_Devices_HumanInterfaceDevice            -> HidD_*/HidP_* + GUID_DEVINTERFACE_HID
+#   Win32_Storage_FileSystem                      -> CreateFileW, ReadFile, FILE_* flags
+#   Win32_System_IO                               -> OVERLAPPED, GetOverlappedResult/Ex, CancelIoEx
+#   Win32_System_Threading                        -> CreateEventW, ResetEvent, WaitForSingleObject, INFINITE
+#   Win32_System_Performance                      -> QueryPerformanceCounter/Frequency
+#   Win32_UI_Input_XboxController                 -> XInputGetState (XInput fallback backend)
+#   Win32_Security                                -> SECURITY_ATTRIBUTES, required because
+#                                                    CreateFileW/CreateEventW are #[cfg]-gated on
+#                                                    it (their signatures reference the type)
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_Performance",
+    "Win32_UI_Input_XboxController",
+]
+
 [lints]
 workspace = true

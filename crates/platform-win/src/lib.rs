@@ -11,8 +11,10 @@
 //! * [`hidhide`] — hide the physical pad from everything but us via HidHide IOCTLs (CLI fallback).
 //!
 //! The guards' `Drop` impls are **real and no-op-safe**: dropping a guard that never acquired its
-//! resource does nothing. The Win32 acquisition bodies are M1 bring-up stubs (`TODO(hardware)`);
-//! the signatures and RAII lifetimes are final. On non-Windows targets the crate is empty.
+//! resource does nothing. The Win32 acquisition bodies call the real APIs (`windows` 0.62 typed
+//! bindings, plus the two undocumented `ntdll` timer exports declared directly). HidHide's primary
+//! bring-up path shells out to `HidHideCLI.exe`; its direct-IOCTL backend is framed but its control
+//! codes are `// HW-verify` TODOs. On non-Windows targets the crate is empty.
 #![cfg(windows)]
 
 pub mod hidhide;

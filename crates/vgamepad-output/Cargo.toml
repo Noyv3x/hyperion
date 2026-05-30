@@ -10,5 +10,13 @@ authors.workspace = true
 [dependencies]
 hyperion-core = { path = "../core" }
 
+# Pure-Rust ViGEmBus FFI (Win32 bindings via the `windows` crate; no build.rs / no Windows SDK
+# required, so it type-checks under `cargo check --target x86_64-pc-windows-msvc` on Linux).
+# `default-features = false` drops the DualShock 4 surface; we only need the Xbox 360 target.
+[target.'cfg(windows)'.dependencies.vigem-rust]
+version = "0.1.1"
+default-features = false
+features = ["x360"]
+
 [lints]
 workspace = true

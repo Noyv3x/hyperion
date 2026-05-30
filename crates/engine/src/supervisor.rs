@@ -1,12 +1,13 @@
 //! Lifecycle supervisor (Windows only): timer resolution, HidHide, ViGEm target, and hot
 //! thread spawn/join (`DESIGN.md` §6 SUPERVISOR / §8).
 //!
-//! # Skeleton status (M1)
-//! The **ordering and ownership are real** — the timer-resolution guard is taken *before* the
-//! hot thread spawns and dropped *after* it joins; the policy guard is bound on the hot thread
-//! for its whole life (so MMCSS/affinity is not reverted one line later). The actual HID
-//! enumeration/open, HidHide IOCTLs, and ViGEm plug/wait/update are filled in during hardware
-//! bring-up — they live in the `platform-win`, `hid-input`, and `vgamepad-output` crates.
+//! The **ordering and ownership are real and wired**: the timer-resolution guard
+//! ([`platform_win::begin_timer_resolution`]) is taken *before* the hot thread spawns and
+//! dropped *after* it joins; the MMCSS/affinity policy guard is bound on the hot thread for its
+//! whole life (so it is not reverted one line later). The HID open + HidHide cloak and the
+//! ViGEm plug/wait happen *on the hot thread* (those handles are thread-affine) via the
+//! [`crate::win_io`] adapters, which wrap the `hid-input` / `vgamepad-output` / `platform-win`
+//! backends. The Win32 bodies inside those backends are validated on hardware by the maintainer.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -16,7 +17,8 @@ use hyperion_core::config::EngineConfig;
 
 use crate::config_store::ConfigStore;
 use crate::handoff::{self, CommandTx, ConfigHandle, TelemetryRx};
-use crate::hot::StopReason;
+use crate::hot::{HotThread, StopReason};
+use crate::win_io::{DualSenseDevice, Vigem360Target};
 
 /// A supervisor / lifecycle error.
 #[derive(Debug)]
@@ -127,20 +129,29 @@ impl Supervisor {
     ///    thread's whole life (`let _policy = ...; hot.run();`).
     /// 4. `join` the hot thread, then drop the timer-resolution guard.
     pub fn run(mut self) -> Result<(), EngineError> {
-        // (1) Timer resolution — held until after join.
-        let _timer_res = acquire_timer_resolution()?;
+        // Snapshot the lifecycle parameters once (timer resolution, thread policy, HidHide).
+        // The hot loop reads live config through the ArcSwap; these host-policy knobs are taken
+        // at spawn and held for the run.
+        let cfg = (*self.config.load_full()).clone();
 
-        // (2) Device + virtual target. The real open/plug live in the platform crates; until
-        // bring-up wires them, the headless slice has nothing to drive and returns cleanly.
+        // (1) Timer resolution — raised before any hot work, restored after join. Real
+        // `NtSetTimerResolution` lives in `platform-win`; the guard is owned here so its `Drop`
+        // runs strictly after `handle.join()` below (DESIGN §6 verifier (e)).
+        let _timer_res = platform_win::begin_timer_resolution(cfg.thread.timer_resolution_us);
+
+        // (2) Device + virtual target are opened *on the hot thread* (the HID handle, the ViGEm
+        // client, and the MMCSS/affinity policy are all thread-affine — they must live on the
+        // dedicated hot thread, not be created here and moved). If no device is present the hot
+        // thread returns `DeviceLost` cleanly, so the headless slice exits without error.
         let hot_links = match self.hot_links.take() {
             Some(links) => links,
             None => return Ok(()),
         };
 
         // (3) Spawn the hot thread with the policy guard bound inside it.
-        let handle = spawn_hot(self.config.clone(), self.config_gen.clone(), hot_links)?;
+        let handle = spawn_hot(cfg, self.config.clone(), self.config_gen.clone(), hot_links)?;
 
-        // (4) Join, then the timer-resolution guard drops here.
+        // (4) Join, then the timer-resolution guard drops here (after the hot thread is gone).
         match handle.join() {
             Ok(StopReason::Shutdown) | Ok(StopReason::DeviceLost) => Ok(()),
             Err(_) => Err(EngineError::HotPanic),
@@ -148,49 +159,47 @@ impl Supervisor {
     }
 }
 
-/// RAII timer-resolution guard. Real impl lives in `platform-win` (`NtSetTimerResolution`
-/// with the original captured via `NtQueryTimerResolution`, restored on `Drop`). M1 skeleton
-/// is a no-op placeholder so the ordering is exercised.
-struct TimerResGuard;
-
-impl Drop for TimerResGuard {
-    fn drop(&mut self) {
-        // platform-win restores the original timer resolution here.
-    }
-}
-
-/// Acquire the 0.5 ms timer resolution before any hot work. Skeleton: never fails.
-fn acquire_timer_resolution() -> Result<TimerResGuard, EngineError> {
-    Ok(TimerResGuard)
-}
-
-/// Spawn the hot thread. The real body constructs the `DualSenseUsbSource` + `Vigem360Pad`,
-/// binds the MMCSS/affinity policy guard, and runs [`crate::hot::HotThread::run`]. M1
-/// skeleton: spawns a thread that immediately reports `Shutdown` so `run()`'s join path is
-/// exercised without real hardware.
+/// Spawn the hot thread, doing all thread-affine acquisition *inside* the spawned thread.
+///
+/// Order on the hot thread (DESIGN §6/§8):
+/// 1. bind the MMCSS/affinity/priority policy guard for the thread's whole life
+///    (`let _policy = ...;` — a bare statement would revert it one line later, verifier (c));
+/// 2. open the physical [`DualSenseDevice`] through HidHide (whitelist self → blacklist the
+///    physical pad → cloak on); on device-not-found, return `DeviceLost` (headless, clean exit);
+/// 3. create + plug the [`Vigem360Target`] (`plugin` then `wait_ready`);
+/// 4. run [`HotThread::run`] to steady state.
 fn spawn_hot(
+    cfg: EngineConfig,
     config: ConfigHandle,
     config_gen: Arc<AtomicU64>,
     links: HotLinks,
 ) -> Result<JoinHandle<StopReason>, EngineError> {
+    let HotLinks {
+        commands,
+        telemetry,
+    } = links;
+
     let handle = std::thread::Builder::new()
         .name("hyperion-hot".to_string())
         .spawn(move || {
-            // Bring-up wires the real hot thread here. The captured resources live on this
-            // thread for its whole life:
-            //   let _policy = platform_win::sched::apply_hot_thread_policy(...);  // bound for life
-            //   let device = hid_input::DualSenseUsbSource::open(...)?;
-            //   let target = vgamepad_output::Vigem360Pad::plugged(...)?;
-            //   HotThread::new(device, target, config, config_gen,
-            //                  links.commands, links.telemetry).run()
-            // Destructure so the field moves are exercised exactly as bring-up will consume
-            // them (HotThread::run takes `commands` + `telemetry`).
-            let HotLinks {
-                commands,
-                telemetry,
-            } = links;
-            drop((config, config_gen, commands, telemetry));
-            StopReason::Shutdown
+            // (1) Host-thread policy, bound for the thread's whole life (NOT a bare statement).
+            let policy = crate::win_io::hot_thread_config(&cfg);
+            let _policy = platform_win::apply_hot_thread_policy(&policy);
+
+            // (2) Open the physical device behind the HidHide cloak. A missing device (or a
+            // HidHide/driver error) is a clean headless exit, not a panic.
+            let Some(device) = DualSenseDevice::open_cloaked(&cfg) else {
+                return StopReason::DeviceLost;
+            };
+
+            // (3) Create + plug the virtual Xbox 360 target and wait for OS enumeration.
+            let Some(target) = Vigem360Target::plugged() else {
+                return StopReason::DeviceLost;
+            };
+
+            // (4) Run the steady-state loop. The HidHide cloak (held inside `device`), the
+            // ViGEm target, and `_policy` all drop on this thread when `run` returns.
+            HotThread::new(device, target, config, config_gen, commands, telemetry).run()
         })
         .map_err(|e| EngineError::Platform(e.to_string()))?;
     Ok(handle)

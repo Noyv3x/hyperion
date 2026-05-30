@@ -70,9 +70,13 @@ impl DeviceSource for RawHidGenericSource {
     }
 
     fn next_sample(&mut self, out: &mut InputSample) -> Result<bool, SourceError> {
-        // TODO(hardware): on a completed raw report, extract each `FieldSpec` per `self.layout`
-        // and hand the values to `hyperion_core::input::normalize` to fill `out`. Returns
-        // `Ok(false)` on a benign timeout. No layout is validated against real hardware in M1.
+        // The overlapped read path is real (see `crate::win::hid`), but the per-field decode
+        // stays a skeleton: it needs a concrete report descriptor to validate the `StickLayout`
+        // offsets against real hardware. Until a user supplies one, a completed report is
+        // acknowledged but not decoded, so callers never see synthetic data.
+        //
+        // TODO(hardware): extract each `FieldSpec` per `self.layout` from `buf` and hand the
+        // raw values to `hyperion_core::input::normalize` to fill `out`, then return `Ok(true)`.
         match self.reader.read_completed()? {
             Some(buf) => {
                 let _ = (buf, &self.layout, &mut *out);

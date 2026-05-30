@@ -21,10 +21,20 @@ pub mod handoff;
 pub mod seq;
 pub mod telemetry;
 
+/// Re-export of the pure [`hyperion_core`] config tree so binaries that depend only on
+/// `engine` (e.g. the headless `app`) can build / load an [`EngineConfig`] without taking a
+/// direct dependency on `hyperion-core`. This is a flat re-export — the types are owned by
+/// core and unchanged.
+pub mod config {
+    pub use hyperion_core::config::{load_toml, to_toml, EngineConfig};
+}
+
 #[cfg(windows)]
 pub mod hot;
 #[cfg(windows)]
 pub mod supervisor;
+#[cfg(windows)]
+mod win_io;
 
 /// Assemble the supervisor + hot thread and run until shutdown (Windows only).
 ///

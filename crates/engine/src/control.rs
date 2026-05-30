@@ -10,17 +10,23 @@
 //! These types are platform-independent (the channel + writer thread run on every target) so
 //! they live outside the `cfg(windows)` runtime spawn and stay covered by the Linux unit tests.
 //!
-//! # M3 scope
-//! M3 wires the **binding / profile / assignment / stick-and-trigger-settings** edits end to
-//! end (blueprint §9). The macro / special-action / mouse / gyro / auto-switch variants exist so
-//! the GUI and the writer compile against the full surface, but the M3 [`config_store`] arms for
-//! them are **accepted-but-no-op** placeholders (their consumers land in M4/M5); they are marked
-//! `TODO(M4)` / `TODO(M5)` in [`crate::config_store`].
+//! # Scope (M3 + M4)
+//! M3 wired the **binding / profile / assignment / stick-and-trigger-settings** edits end to end
+//! (blueprint §9). **M4** makes the macro / special-action / mouse / turbo / shift edits do real
+//! work: [`ControlMsg::UpsertMacro`]/[`ControlMsg::DeleteMacro`],
+//! [`ControlMsg::UpsertSpecialAction`]/[`ControlMsg::DeleteSpecialAction`],
+//! [`ControlMsg::SetMouseSettings`], [`ControlMsg::SetBindingTurbo`], and
+//! [`ControlMsg::SetShiftTrigger`] all mutate the active profile in [`crate::config_store`] now.
+//! The gyro / auto-switch variants remain forward-compat (their consumers land in M5).
+
+use std::sync::Arc;
 
 use hyperion_core::config::{HidHideConfig, StickMode, ThreadConfig};
 use hyperion_core::input::Control;
-use hyperion_core::map::{BindTarget, MacroDef, ShiftTrigger, SpecialAction};
-use hyperion_core::output::PadTarget;
+use hyperion_core::map::{
+    BindTarget, MacroDef, MouseSettings, ShiftTrigger, SpecialAction, TurboCfg,
+};
+use hyperion_core::output::{KbmBatch, KbmEvent, PadTarget};
 use hyperion_core::rc::RcConfig;
 use hyperion_core::stick::settings::StickSettings;
 use hyperion_core::trigger::TriggerSettings;
@@ -168,8 +174,19 @@ pub enum ControlMsg {
         /// The binding applied while the shift trigger is active.
         bind: BindTarget,
     },
+    /// Set (or clear, with `turbo == None`) the per-binding turbo / rapid-fire config for `control`
+    /// in `profile` (inserts the slot if absent). **M4 consumer** in `apply` (`turbo_gate`); the
+    /// `TurboCfg` is clamped to a sane period/duty by the writer's `clamped()` funnel.
+    SetBindingTurbo {
+        /// Profile id.
+        profile: String,
+        /// The control whose turbo is edited.
+        control: Control,
+        /// The turbo config (`None` clears turbo for the slot).
+        turbo: Option<TurboCfg>,
+    },
 
-    // ---- Stick / trigger settings (blueprint §9) ----
+    // ---- Stick / trigger / mouse settings (blueprint §9) ----
     /// Replace one stick's full settings for `profile` (clamped on apply). Folds the RC config in.
     SetStickSettings {
         /// Profile id.
@@ -188,36 +205,150 @@ pub enum ControlMsg {
         /// The new trigger settings (validated/clamped by the writer).
         settings: TriggerSettings,
     },
+    /// Replace a profile's mouse-from-stick settings (clamped on apply). **M4 consumer**: the
+    /// resolved form feeds `apply`'s [`MouseAccumulator`](hyperion_core::mouse_accum::MouseAccumulator).
+    SetMouseSettings {
+        /// Profile id.
+        profile: String,
+        /// The new mouse settings (validated/clamped by the writer).
+        settings: MouseSettings,
+    },
 
-    // ---- M4/M5 surface: accepted-but-no-op in M3 (consumers land later; §9) ----
-    /// Insert or replace a macro definition in `profile`. **M4 consumer** (no-op in M3).
+    // ---- Macros / special actions (M4 consumers; §9) ----
+    /// Insert or replace a macro definition in `profile` (its `id` is the key). **M4 consumer**:
+    /// the injector thread plays its step list on a `Macro{start}` edge.
     UpsertMacro {
         /// Profile id.
         profile: String,
         /// The macro definition (its `id` is the key).
         def: MacroDef,
     },
-    /// Delete a macro by id from `profile`. **M4 consumer** (no-op in M3).
+    /// Delete a macro by id from `profile`. **M4 consumer**.
     DeleteMacro {
         /// Profile id.
         profile: String,
         /// Macro id to delete.
         id: u16,
     },
-    /// Insert or replace a special action in `profile`. **M4/M5 consumer** (no-op in M3).
+    /// Insert or replace a special action in `profile` (its `id` is the key). **M4 consumer**:
+    /// referenced by `BindTarget::Special(id)`, fired through the control-plane side channel.
     UpsertSpecialAction {
         /// Profile id.
         profile: String,
         /// The special action (its `id` is the key).
         action: SpecialAction,
     },
-    /// Delete a special action by id from `profile`. **M4/M5 consumer** (no-op in M3).
+    /// Delete a special action by id from `profile`. **M4 consumer**.
     DeleteSpecialAction {
         /// Profile id.
         profile: String,
         /// Special action id to delete.
         id: u16,
     },
-    /// Enable / disable foreground auto-profile-switching. **M5 consumer** (no-op in M3).
+
+    // ---- M5 surface: accepted-but-no-op (consumers land later; §9) ----
+    /// Enable / disable foreground auto-profile-switching. **M5 consumer** (no-op until M5).
     SetAutoSwitchEnabled(bool),
+}
+
+/// An event the hot loop sends **out** to the control plane (blueprint §5/§12 M4: "Special edges to
+/// a control-plane side channel"). Distinct from [`ControlMsg`] (which flows GUI → writer): this is
+/// the hot thread → supervisor direction, carrying things that must run **off** the hot path.
+///
+/// `Copy`-of-`Arc` only (`Special` is a bare `u16`; `Macros` shares the resolved profile's macro
+/// table by refcount), so producing one on the hot thread never allocates beyond the single
+/// `crossbeam` enqueue.
+#[derive(Clone, Debug)]
+pub enum ControlPlaneEvent {
+    /// A `BindTarget::Special(id)` rising edge fired in `apply()`. The control plane runs the
+    /// matching [`SpecialAction`] (profile switch / launch / disconnect) entirely off the hot path;
+    /// for M4 a stub handler logs/acks it.
+    Special(u16),
+    /// The resolved active profile's macro table, republished on start and on every profile change
+    /// so the injector's `MacroPlayer` can play a `Macro{start}` edge by id. Arc-shared, so this is
+    /// a refcount bump, never a deep copy of the step lists (blueprint §7.1).
+    Macros(Arc<[MacroDef]>),
+}
+
+/// The hot side of the control-plane side channel: the producer the hot loop pushes
+/// [`ControlPlaneEvent`]s into. A bounded `crossbeam` sender; `try_send` is non-blocking so a full
+/// channel (a wedged control plane) never stalls the TIME_CRITICAL hot thread — the event is
+/// dropped (special actions are idempotent on the next edge; the macro table is re-sent on the next
+/// gate).
+pub type ControlPlaneTx = crossbeam_channel::Sender<ControlPlaneEvent>;
+
+/// The control-plane side of the channel: the consumer the supervisor drains off the hot path.
+pub type ControlPlaneRx = crossbeam_channel::Receiver<ControlPlaneEvent>;
+
+/// Forward every `Special(id)` rising edge in `batch` to the control plane, non-blocking.
+///
+/// Pure routing helper (Linux-testable): scans the already-produced [`KbmBatch`] for
+/// [`KbmEvent::Special`] and `try_send`s each id on `tx`. Returns the number of specials forwarded.
+/// A closed/full channel drops the event (the next edge re-sends) — the hot thread never blocks.
+/// Called by the hot loop after `apply()`; the rest of the batch (key/mouse/macro edges) still goes
+/// to the KBM injector ring (which ignores `Special` defensively).
+#[inline]
+pub fn forward_specials(batch: &KbmBatch, tx: &ControlPlaneTx) -> usize {
+    let mut n = 0;
+    for &ev in batch.as_slice() {
+        if let KbmEvent::Special { id } = ev {
+            // Drop-on-full / disconnected: special actions re-fire on the next rising edge, so a
+            // missed one is self-healing and must never wedge the hot thread.
+            let _ = tx.try_send(ControlPlaneEvent::Special(id));
+            n += 1;
+        }
+    }
+    n
+}
+
+#[cfg(test)]
+mod tests {
+    // `KbmBatch` / `KbmEvent` come in via `super::*` (the file-level import); only `MouseButton`
+    // is additionally needed here.
+    use super::*;
+    use hyperion_core::output::MouseButton;
+
+    #[test]
+    fn forward_specials_extracts_only_special_ids() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut batch = KbmBatch::new();
+        batch.push(KbmEvent::MouseButton {
+            btn: MouseButton::Left,
+            down: true,
+        });
+        batch.push(KbmEvent::Special { id: 4 });
+        batch.push(KbmEvent::Macro { id: 1, start: true });
+        batch.push(KbmEvent::Special { id: 9 });
+
+        let n = forward_specials(&batch, &tx);
+        assert_eq!(n, 2, "two Special edges forwarded");
+
+        let mut got = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ControlPlaneEvent::Special(id) => got.push(id),
+                ControlPlaneEvent::Macros(_) => panic!("no macro event expected"),
+            }
+        }
+        assert_eq!(got, vec![4, 9]);
+    }
+
+    #[test]
+    fn forward_specials_on_empty_batch_sends_nothing() {
+        let (tx, rx) = crossbeam_channel::unbounded::<ControlPlaneEvent>();
+        let batch = KbmBatch::new();
+        assert_eq!(forward_specials(&batch, &tx), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn forward_specials_full_channel_drops_without_blocking() {
+        // A bounded, full channel must drop the event (never block the hot thread).
+        let (tx, _rx) = crossbeam_channel::bounded::<ControlPlaneEvent>(1);
+        tx.try_send(ControlPlaneEvent::Special(0)).unwrap(); // fill it
+        let mut batch = KbmBatch::new();
+        batch.push(KbmEvent::Special { id: 42 });
+        // Returns the count it tried to forward; the send itself is dropped silently.
+        assert_eq!(forward_specials(&batch, &tx), 1);
+    }
 }

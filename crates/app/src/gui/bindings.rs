@@ -1,47 +1,101 @@
-//! The minimal M3 Mapping screen: a single `Control → Binding` remap row.
+//! The Mapping screen (`DESIGN-REMAP.md` §8 mapping.rs): bind any [`Control`] to any
+//! [`BindTarget`], with an optional per-control **shift trigger** + shift bind and an optional
+//! **turbo** / rapid-fire (blueprint §5).
 //!
-//! `DESIGN-REMAP.md` §8 (mapping.rs) describes the full controller-diagram editor; M3 ships the
-//! **one basic remap path** the milestone exit criteria call for (Cross→Xbox-B and Square→key-A):
-//! pick a [`Control`], pick a simple [`BindTarget`] — a virtual-pad [`PadBtn`] or a captured
-//! keyboard [`Key`](BindTarget::Key) — and apply it. The per-control shift / turbo / macro / mouse
-//! editors land in M4/M5; the data model already carries those fields so this is purely additive.
-//!
-//! The screen is **stateless with respect to the engine**: it never reads the live binding table
-//! (that lives in the hot-facing `ResolvedProfile`); it only *emits* `ControlMsg::SetBinding`
-//! (a remap) or a `Passthrough` slot (a clear) through [`super::HyperionApp::push_binding`]. The
-//! editor's transient selection lives in [`BindingEditor`].
+//! M4 expands the M3 single-row editor into the full per-control surface the milestone calls for:
+//! pick a source control, choose the base bind kind (passthrough / unbound / gamepad-button /
+//! gamepad-axis / touchpad-click / key / mouse-button / mouse-move / mouse-wheel / macro / special),
+//! then optionally attach a shift layer (a trigger control + the bind used while it is held) and a
+//! turbo cycle. The screen is **stateless with respect to the engine**: it never reads the live
+//! binding table (that lives in the hot-facing `ResolvedProfile`); it only *emits*
+//! `ControlMsg::SetBinding` / `SetShiftTrigger` / `SetBindingTurbo` through the
+//! [`super::HyperionApp`] push helpers. The transient selection lives in [`BindingEditor`].
 
 use eframe::egui;
 use hyperion_core::input::Control;
-use hyperion_core::map::{BindTarget, KeyKind, PadBtn};
+use hyperion_core::map::{
+    BindTarget, KeyKind, MacroDef, MouseMoveSrc, PadBtn, ShiftTrigger, TurboCfg, WheelDir,
+};
+use hyperion_core::output::MouseButton;
 
-/// Transient state for the single binding-editor row (never persisted; rebuilt each session).
+/// Transient state for the binding editor (never persisted; rebuilt each session).
 #[derive(Clone)]
 pub struct BindingEditor {
     /// The physical control currently selected as the remap source.
     control: Control,
-    /// Which binding *kind* the row is composing.
-    kind: BindKind,
-    /// Selected virtual-pad button (when `kind == GamepadButton`).
-    pad_btn: PadBtn,
-    /// Captured keyboard virtual-key code (when `kind == Key`); `None` until a key is pressed.
-    captured_vk: Option<u16>,
-    /// Human label for the captured key (display only).
-    captured_label: String,
-    /// Whether the key-capture widget is armed (next key press is recorded).
-    capturing: bool,
-    /// Inject the captured key as a hardware scancode (game-compatible) rather than a virtual key.
-    scan_code: bool,
-    /// Toggle (latch) rather than hold-while-pressed.
-    toggle: bool,
+    /// The base bind composer (kind + payload selections).
+    base: BindComposer,
+    /// Whether a shift layer is being attached.
+    shift_enabled: bool,
+    /// The control whose pressed state activates the shift bind.
+    shift_trigger: Control,
+    /// The bind used while the shift trigger is held.
+    shift: BindComposer,
+    /// Whether turbo / rapid-fire is attached.
+    turbo_enabled: bool,
+    /// Turbo full-cycle period, milliseconds (the UI unit; converted to `period_us` on apply).
+    turbo_period_ms: u32,
+    /// Turbo ON-fraction numerator.
+    turbo_duty_num: u16,
+    /// Turbo ON-fraction denominator.
+    turbo_duty_den: u16,
 }
 
 impl Default for BindingEditor {
     fn default() -> Self {
         Self {
             control: Control::Cross,
+            base: BindComposer::default(),
+            shift_enabled: false,
+            shift_trigger: Control::L1,
+            shift: BindComposer::default(),
+            turbo_enabled: false,
+            turbo_period_ms: 100,
+            turbo_duty_num: 1,
+            turbo_duty_den: 2,
+        }
+    }
+}
+
+/// The composer for one [`BindTarget`] (used for both the base bind and the shift bind).
+#[derive(Clone)]
+struct BindComposer {
+    /// Which binding *kind* is being composed.
+    kind: BindKind,
+    /// Selected virtual-pad button (when `kind == GamepadButton`).
+    pad_btn: PadBtn,
+    /// Selected mouse button (when `kind == MouseButton`).
+    mouse_btn: UiMouseButton,
+    /// Selected mouse-move source (when `kind == MouseMove`).
+    mouse_src: UiMouseSrc,
+    /// Selected wheel direction (when `kind == MouseWheel`).
+    wheel_dir: UiWheelDir,
+    /// Selected macro id (when `kind == Macro`).
+    macro_id: u16,
+    /// Selected special-action id (when `kind == Special`).
+    special_id: u16,
+    /// Captured keyboard virtual-key code (when `kind == Key`); `None` until a key is pressed.
+    captured_vk: Option<u16>,
+    /// Human label for the captured key (display only).
+    captured_label: String,
+    /// Whether the key-capture widget is armed (next key press is recorded).
+    capturing: bool,
+    /// Inject the captured key as a hardware scancode rather than a virtual key.
+    scan_code: bool,
+    /// Toggle (latch) rather than hold-while-pressed.
+    toggle: bool,
+}
+
+impl Default for BindComposer {
+    fn default() -> Self {
+        Self {
             kind: BindKind::GamepadButton,
             pad_btn: PadBtn::B,
+            mouse_btn: UiMouseButton::Left,
+            mouse_src: UiMouseSrc::RightStick,
+            wheel_dir: UiWheelDir::Up,
+            macro_id: 0,
+            special_id: 0,
             captured_vk: None,
             captured_label: String::new(),
             capturing: false,
@@ -51,29 +105,148 @@ impl Default for BindingEditor {
     }
 }
 
-/// Which simple binding kind the M3 row composes (a small UI-only discriminator).
+/// Which binding kind a [`BindComposer`] composes (a UI-only discriminator over [`BindTarget`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BindKind {
-    /// Identity passthrough (clears any remap on the selected control).
+    /// Identity passthrough (the natural "clear" for the base bind).
     Passthrough,
+    /// Explicitly unbound (suppress identity, emit nothing).
+    Unbound,
     /// Drive a virtual-pad button.
     GamepadButton,
     /// Inject a keyboard key.
     Key,
+    /// Inject a mouse button.
+    MouseButton,
+    /// Feed a mouse-move accumulator from a stick.
+    MouseMove,
+    /// Emit mouse-wheel notches.
+    MouseWheel,
+    /// Trigger a macro by id.
+    Macro,
+    /// Fire a special action by id.
+    Special,
 }
 
 impl BindKind {
-    const ALL: [BindKind; 3] = [
+    const ALL: [BindKind; 9] = [
         BindKind::Passthrough,
+        BindKind::Unbound,
         BindKind::GamepadButton,
         BindKind::Key,
+        BindKind::MouseButton,
+        BindKind::MouseMove,
+        BindKind::MouseWheel,
+        BindKind::Macro,
+        BindKind::Special,
     ];
 
     fn label(self) -> &'static str {
         match self {
             BindKind::Passthrough => "Passthrough (clear)",
+            BindKind::Unbound => "Unbound (suppress)",
             BindKind::GamepadButton => "Gamepad button",
             BindKind::Key => "Keyboard key",
+            BindKind::MouseButton => "Mouse button",
+            BindKind::MouseMove => "Mouse move (from stick)",
+            BindKind::MouseWheel => "Mouse wheel",
+            BindKind::Macro => "Macro",
+            BindKind::Special => "Special action",
+        }
+    }
+}
+
+/// UI mirror of [`MouseButton`] (a closed combo set with stable labels).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiMouseButton {
+    Left,
+    Right,
+    Middle,
+    X1,
+    X2,
+}
+
+impl UiMouseButton {
+    const ALL: [UiMouseButton; 5] = [
+        UiMouseButton::Left,
+        UiMouseButton::Right,
+        UiMouseButton::Middle,
+        UiMouseButton::X1,
+        UiMouseButton::X2,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            UiMouseButton::Left => "Left",
+            UiMouseButton::Right => "Right",
+            UiMouseButton::Middle => "Middle",
+            UiMouseButton::X1 => "X1 (back)",
+            UiMouseButton::X2 => "X2 (forward)",
+        }
+    }
+    fn to_core(self) -> MouseButton {
+        match self {
+            UiMouseButton::Left => MouseButton::Left,
+            UiMouseButton::Right => MouseButton::Right,
+            UiMouseButton::Middle => MouseButton::Middle,
+            UiMouseButton::X1 => MouseButton::X1,
+            UiMouseButton::X2 => MouseButton::X2,
+        }
+    }
+}
+
+/// UI mirror of [`MouseMoveSrc`] (the stick sources; gyro is M5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiMouseSrc {
+    LeftStick,
+    RightStick,
+}
+
+impl UiMouseSrc {
+    const ALL: [UiMouseSrc; 2] = [UiMouseSrc::LeftStick, UiMouseSrc::RightStick];
+    fn label(self) -> &'static str {
+        match self {
+            UiMouseSrc::LeftStick => "Left stick",
+            UiMouseSrc::RightStick => "Right stick",
+        }
+    }
+    fn to_core(self) -> MouseMoveSrc {
+        match self {
+            UiMouseSrc::LeftStick => MouseMoveSrc::LeftStick,
+            UiMouseSrc::RightStick => MouseMoveSrc::RightStick,
+        }
+    }
+}
+
+/// UI mirror of [`WheelDir`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiWheelDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl UiWheelDir {
+    const ALL: [UiWheelDir; 4] = [
+        UiWheelDir::Up,
+        UiWheelDir::Down,
+        UiWheelDir::Left,
+        UiWheelDir::Right,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            UiWheelDir::Up => "Up",
+            UiWheelDir::Down => "Down",
+            UiWheelDir::Left => "Left",
+            UiWheelDir::Right => "Right",
+        }
+    }
+    fn to_core(self) -> WheelDir {
+        match self {
+            UiWheelDir::Up => WheelDir::Up,
+            UiWheelDir::Down => WheelDir::Down,
+            UiWheelDir::Left => WheelDir::Left,
+            UiWheelDir::Right => WheelDir::Right,
         }
     }
 }
@@ -82,14 +255,16 @@ impl BindKind {
 pub fn mapping_panel(ui: &mut egui::Ui, app: &mut super::HyperionApp) {
     ui.heading("Mapping");
     ui.label(
-        "Pick a control, choose what it should do, then Apply. \
-         M3 supports passthrough, gamepad-button, and keyboard-key bindings.",
+        "Pick a control, choose what it does, optionally attach a shift layer and/or turbo, \
+         then Apply. The shift trigger and turbo are sent as separate edits so they compose with \
+         the base bind.",
     );
     ui.separator();
 
-    // Build the row against a local copy of the editor state, then write it back. Capturing a key
-    // needs the egui InputState, so it is read inside this closure.
+    // Work on a local copy of the editor + the macro list (the macro combo needs the live ids);
+    // write the editor back at the end. Capturing a key needs the egui InputState, read inside.
     let mut ed = app.binding_editor_mut().clone();
+    let macros = app.mirror_mut().macros.clone();
 
     // --- Source control ------------------------------------------------------------------------
     ui.horizontal(|ui| {
@@ -98,97 +273,288 @@ pub fn mapping_panel(ui: &mut egui::Ui, app: &mut super::HyperionApp) {
             .selected_text(control_label(ed.control))
             .show_ui(ui, |ui| {
                 for c in Control::ALL {
-                    // None is the "no control" sentinel — not a bindable source.
                     if c == Control::None {
-                        continue;
+                        continue; // the "no control" sentinel is not a bindable source.
                     }
                     ui.selectable_value(&mut ed.control, c, control_label(c));
                 }
             });
     });
 
-    // --- Binding kind --------------------------------------------------------------------------
-    ui.horizontal(|ui| {
-        ui.label("Bind to:");
-        egui::ComboBox::from_id_salt("binding-kind")
-            .selected_text(ed.kind.label())
-            .show_ui(ui, |ui| {
-                for k in BindKind::ALL {
-                    ui.selectable_value(&mut ed.kind, k, k.label());
-                }
-            });
+    // --- Base bind -----------------------------------------------------------------------------
+    ui.group(|ui| {
+        ui.label(egui::RichText::new("Base binding").strong());
+        bind_composer_ui(ui, "base", &mut ed.base, &macros);
     });
 
-    // --- Kind-specific editor ------------------------------------------------------------------
-    match ed.kind {
-        BindKind::Passthrough => {
-            ui.label("This control will pass through unchanged (identity).");
-        }
-        BindKind::GamepadButton => {
+    // --- Shift layer ---------------------------------------------------------------------------
+    ui.add_space(4.0);
+    ui.checkbox(&mut ed.shift_enabled, "Attach a shift layer");
+    if ed.shift_enabled {
+        ui.group(|ui| {
             ui.horizontal(|ui| {
-                ui.label("Button:");
-                egui::ComboBox::from_id_salt("binding-padbtn")
-                    .selected_text(padbtn_label(ed.pad_btn))
+                ui.label("Shift trigger:");
+                egui::ComboBox::from_id_salt("shift-trigger")
+                    .selected_text(control_label(ed.shift_trigger))
                     .show_ui(ui, |ui| {
-                        for b in PAD_BTNS {
-                            ui.selectable_value(&mut ed.pad_btn, b, padbtn_label(b));
+                        for c in Control::ALL {
+                            if c == Control::None {
+                                continue;
+                            }
+                            ui.selectable_value(&mut ed.shift_trigger, c, control_label(c));
                         }
                     });
             });
-        }
-        BindKind::Key => {
-            key_capture(ui, &mut ed);
-        }
+            ui.label("While the trigger is held, this control uses:");
+            bind_composer_ui(ui, "shift", &mut ed.shift, &macros);
+        });
+    }
+
+    // --- Turbo ---------------------------------------------------------------------------------
+    ui.add_space(4.0);
+    ui.checkbox(&mut ed.turbo_enabled, "Attach turbo / rapid-fire");
+    if ed.turbo_enabled {
+        ui.group(|ui| {
+            ui.add(egui::Slider::new(&mut ed.turbo_period_ms, 10..=1000).text("cycle period (ms)"));
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut ed.turbo_duty_num, 1..=ed.turbo_duty_den).text("ON"));
+                ui.label("/");
+                ui.add(egui::Slider::new(&mut ed.turbo_duty_den, 1..=16).text("of"));
+            });
+            // Keep the numerator <= denominator so the duty stays a valid fraction.
+            if ed.turbo_duty_num > ed.turbo_duty_den {
+                ed.turbo_duty_num = ed.turbo_duty_den;
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "≈ {:.0}% ON, {:.1} Hz",
+                    100.0 * ed.turbo_duty_num as f32 / ed.turbo_duty_den as f32,
+                    1000.0 / ed.turbo_period_ms as f32
+                ))
+                .weak(),
+            );
+        });
     }
 
     ui.separator();
 
     // --- Apply ---------------------------------------------------------------------------------
-    let bind = compose_bind(&ed);
-    let can_apply = bind.is_some();
+    let base_bind = compose_bind(&ed.base);
+    let shift_bind = compose_bind(&ed.shift);
+    // The row is applicable when the base bind composes; the shift bind only matters when enabled.
+    let can_apply = base_bind.is_some() && (!ed.shift_enabled || shift_bind.is_some());
     ui.horizontal(|ui| {
         let apply = ui
             .add_enabled(can_apply, egui::Button::new("Apply binding"))
             .clicked();
         if !can_apply {
-            ui.label(egui::RichText::new("capture a key first").weak().italics());
+            ui.label(
+                egui::RichText::new("capture a key for any Key bind first")
+                    .weak()
+                    .italics(),
+            );
         }
         if apply {
-            if let Some(bind) = bind {
-                let control = ed.control;
-                // Stop capturing once applied so the row settles.
-                ed.capturing = false;
-                app.push_binding(control, bind);
-            }
+            apply_binding(app, &mut ed, base_bind, shift_bind);
         }
     });
 
     *app.binding_editor_mut() = ed;
 }
 
-/// The "click to capture, then press a key" widget. Reads the egui [`InputState`] for the next
-/// key press while armed and records its Windows virtual-key code.
-fn key_capture(ui: &mut egui::Ui, ed: &mut BindingEditor) {
+/// Emit the `SetBinding` + (conditional) `SetShiftTrigger` + `SetBindingTurbo` edits for the
+/// composed row. Always sends the base bind; clears or sets the shift layer and turbo to match the
+/// editor's checkboxes so toggling them off actually removes the prior value.
+fn apply_binding(
+    app: &mut super::HyperionApp,
+    ed: &mut BindingEditor,
+    base_bind: Option<BindTarget>,
+    shift_bind: Option<BindTarget>,
+) {
+    let control = ed.control;
+    let Some(base) = base_bind else { return };
+    app.push_binding(control, base);
+
+    // Shift: set (trigger + bind) when enabled and the bind composes; otherwise clear it.
+    if ed.shift_enabled {
+        if let Some(bind) = shift_bind {
+            app.push_shift_trigger(
+                control,
+                Some(ShiftTrigger {
+                    control: ed.shift_trigger,
+                }),
+                bind,
+            );
+        }
+    } else {
+        app.push_shift_trigger(control, None, BindTarget::Passthrough);
+    }
+
+    // Turbo: set when enabled, otherwise clear.
+    if ed.turbo_enabled {
+        app.push_binding_turbo(
+            control,
+            Some(TurboCfg {
+                period_us: ed.turbo_period_ms.saturating_mul(1000).max(1),
+                duty_num: ed.turbo_duty_num,
+                duty_den: ed.turbo_duty_den.max(1),
+            }),
+        );
+    } else {
+        app.push_binding_turbo(control, None);
+    }
+
+    // Settle the key-capture arming once applied.
+    ed.base.capturing = false;
+    ed.shift.capturing = false;
+}
+
+/// Render the kind selector + the kind-specific payload editor for one [`BindComposer`].
+fn bind_composer_ui(ui: &mut egui::Ui, salt: &str, c: &mut BindComposer, macros: &[MacroDef]) {
     ui.horizontal(|ui| {
-        let btn_text = if ed.capturing {
+        ui.label("Bind to:");
+        egui::ComboBox::from_id_salt((salt, "kind"))
+            .selected_text(c.kind.label())
+            .show_ui(ui, |ui| {
+                for k in BindKind::ALL {
+                    ui.selectable_value(&mut c.kind, k, k.label());
+                }
+            });
+    });
+
+    match c.kind {
+        BindKind::Passthrough => {
+            ui.label("Passes through unchanged (identity).");
+        }
+        BindKind::Unbound => {
+            ui.label("Emits nothing and suppresses the identity passthrough.");
+        }
+        BindKind::GamepadButton => {
+            ui.horizontal(|ui| {
+                ui.label("Button:");
+                egui::ComboBox::from_id_salt((salt, "padbtn"))
+                    .selected_text(padbtn_label(c.pad_btn))
+                    .show_ui(ui, |ui| {
+                        for b in PAD_BTNS {
+                            ui.selectable_value(&mut c.pad_btn, b, padbtn_label(b));
+                        }
+                    });
+            });
+        }
+        BindKind::Key => key_capture(ui, salt, c),
+        BindKind::MouseButton => {
+            ui.horizontal(|ui| {
+                ui.label("Mouse button:");
+                egui::ComboBox::from_id_salt((salt, "mousebtn"))
+                    .selected_text(c.mouse_btn.label())
+                    .show_ui(ui, |ui| {
+                        for b in UiMouseButton::ALL {
+                            ui.selectable_value(&mut c.mouse_btn, b, b.label());
+                        }
+                    });
+            });
+        }
+        BindKind::MouseMove => {
+            ui.horizontal(|ui| {
+                ui.label("Source stick:");
+                egui::ComboBox::from_id_salt((salt, "mousesrc"))
+                    .selected_text(c.mouse_src.label())
+                    .show_ui(ui, |ui| {
+                        for s in UiMouseSrc::ALL {
+                            ui.selectable_value(&mut c.mouse_src, s, s.label());
+                        }
+                    });
+            });
+            ui.label(
+                egui::RichText::new("Tune sensitivity / deadzone in the Mouse tab.")
+                    .weak()
+                    .italics(),
+            );
+        }
+        BindKind::MouseWheel => {
+            ui.horizontal(|ui| {
+                ui.label("Direction:");
+                egui::ComboBox::from_id_salt((salt, "wheel"))
+                    .selected_text(c.wheel_dir.label())
+                    .show_ui(ui, |ui| {
+                        for d in UiWheelDir::ALL {
+                            ui.selectable_value(&mut c.wheel_dir, d, d.label());
+                        }
+                    });
+            });
+        }
+        BindKind::Macro => macro_picker(ui, salt, c, macros),
+        BindKind::Special => {
+            ui.horizontal(|ui| {
+                ui.label("Special action id:");
+                ui.add(egui::DragValue::new(&mut c.special_id).range(0..=u16::MAX));
+            });
+            ui.label(
+                egui::RichText::new("Fired through the control-plane side channel (M4 stub).")
+                    .weak()
+                    .italics(),
+            );
+        }
+    }
+}
+
+/// The macro-id picker: a combo over the profile's defined macros (or a hint to add one).
+fn macro_picker(ui: &mut egui::Ui, salt: &str, c: &mut BindComposer, macros: &[MacroDef]) {
+    if macros.is_empty() {
+        ui.label(
+            egui::RichText::new("No macros defined — add one in the Macros tab first.")
+                .weak()
+                .italics(),
+        );
+        return;
+    }
+    // Default the selection to a real id if the current one is not among the defined macros.
+    if !macros.iter().any(|m| m.id == c.macro_id) {
+        c.macro_id = macros[0].id;
+    }
+    ui.horizontal(|ui| {
+        ui.label("Macro:");
+        egui::ComboBox::from_id_salt((salt, "macro"))
+            .selected_text(macro_label(macros, c.macro_id))
+            .show_ui(ui, |ui| {
+                for m in macros {
+                    ui.selectable_value(&mut c.macro_id, m.id, macro_label(macros, m.id));
+                }
+            });
+    });
+}
+
+/// Display label for a macro id (its name + id), falling back to just the id.
+fn macro_label(macros: &[MacroDef], id: u16) -> String {
+    match macros.iter().find(|m| m.id == id) {
+        Some(m) if !m.name.is_empty() => format!("{} (#{id})", m.name),
+        _ => format!("#{id}"),
+    }
+}
+
+/// The "click to capture, then press a key" widget for one composer. Reads the egui [`InputState`]
+/// for the next key press while armed and records its Windows virtual-key code.
+fn key_capture(ui: &mut egui::Ui, salt: &str, c: &mut BindComposer) {
+    ui.horizontal(|ui| {
+        let btn_text = if c.capturing {
             "press any key…".to_string()
         } else {
-            match &ed.captured_vk {
-                Some(_) => format!("key: {}", ed.captured_label),
+            match &c.captured_vk {
+                Some(_) => format!("key: {}", c.captured_label),
                 None => "click to capture".to_string(),
             }
         };
         if ui.button(btn_text).clicked() {
-            ed.capturing = !ed.capturing;
+            c.capturing = !c.capturing;
         }
-        if ed.captured_vk.is_some() && ui.button("clear").clicked() {
-            ed.captured_vk = None;
-            ed.captured_label.clear();
+        if c.captured_vk.is_some() && ui.button("clear").clicked() {
+            c.captured_vk = None;
+            c.captured_label.clear();
         }
+        let _ = salt;
     });
 
-    if ed.capturing {
-        // Find the first key currently held this frame and record it.
+    if c.capturing {
         let captured = ui.input(|i| {
             for key in egui::Key::ALL {
                 if i.key_pressed(*key) {
@@ -199,35 +565,40 @@ fn key_capture(ui: &mut egui::Ui, ed: &mut BindingEditor) {
         });
         if let Some(key) = captured {
             if let Some(vk) = vk_from_egui_key(key) {
-                ed.captured_vk = Some(vk);
-                ed.captured_label = format!("{key:?} (vk 0x{vk:02X})");
+                c.captured_vk = Some(vk);
+                c.captured_label = format!("{key:?} (vk 0x{vk:02X})");
             }
-            ed.capturing = false;
+            c.capturing = false;
         }
     }
 
-    ui.checkbox(&mut ed.scan_code, "Inject as scancode (game-compatible)");
-    ui.checkbox(&mut ed.toggle, "Toggle (latch) instead of hold");
+    ui.checkbox(&mut c.scan_code, "Inject as scancode (game-compatible)");
+    ui.checkbox(&mut c.toggle, "Toggle (latch) instead of hold");
 }
 
-/// Compose the [`BindTarget`] the row currently describes, or `None` when the row is incomplete
-/// (a Key binding with no captured key). The engine wraps this base bind into the profile's
-/// `BindingSlot` on apply (`SetBinding { profile, control, bind }`).
-fn compose_bind(ed: &BindingEditor) -> Option<BindTarget> {
-    Some(match ed.kind {
+/// Compose the [`BindTarget`] a composer currently describes, or `None` when incomplete (a Key bind
+/// with no captured key). The engine wraps this base bind into the profile's `BindingSlot` on apply.
+fn compose_bind(c: &BindComposer) -> Option<BindTarget> {
+    Some(match c.kind {
         BindKind::Passthrough => BindTarget::Passthrough,
-        BindKind::GamepadButton => BindTarget::GamepadButton(ed.pad_btn),
+        BindKind::Unbound => BindTarget::Unbound,
+        BindKind::GamepadButton => BindTarget::GamepadButton(c.pad_btn),
         BindKind::Key => BindTarget::Key {
-            vk: ed.captured_vk?,
+            vk: c.captured_vk?,
             kind: KeyKind {
-                scan_code: ed.scan_code,
-                toggle: ed.toggle,
+                scan_code: c.scan_code,
+                toggle: c.toggle,
             },
         },
+        BindKind::MouseButton => BindTarget::Mouse(c.mouse_btn.to_core()),
+        BindKind::MouseMove => BindTarget::MouseMove(c.mouse_src.to_core()),
+        BindKind::MouseWheel => BindTarget::MouseWheel(c.wheel_dir.to_core()),
+        BindKind::Macro => BindTarget::Macro(c.macro_id),
+        BindKind::Special => BindTarget::Special(c.special_id),
     })
 }
 
-/// The virtual-pad buttons offered in the M3 row (the meaningful X360-mappable subset; the
+/// The virtual-pad buttons offered in the editor (the meaningful X360-mappable subset; the
 /// touchpad / L2-R2-click variants exist on [`PadBtn`] but are left to later screens).
 const PAD_BTNS: [PadBtn; 15] = [
     PadBtn::A,
@@ -335,7 +706,6 @@ fn control_label(c: Control) -> &'static str {
 fn vk_from_egui_key(key: egui::Key) -> Option<u16> {
     use egui::Key::*;
     Some(match key {
-        // Letters (VK == ASCII uppercase).
         A => 0x41,
         B => 0x42,
         C => 0x43,
@@ -362,7 +732,6 @@ fn vk_from_egui_key(key: egui::Key) -> Option<u16> {
         X => 0x58,
         Y => 0x59,
         Z => 0x5A,
-        // Digits (top-row; VK == ASCII).
         Num0 => 0x30,
         Num1 => 0x31,
         Num2 => 0x32,
@@ -373,7 +742,6 @@ fn vk_from_egui_key(key: egui::Key) -> Option<u16> {
         Num7 => 0x37,
         Num8 => 0x38,
         Num9 => 0x39,
-        // Function keys (VK_F1 = 0x70).
         F1 => 0x70,
         F2 => 0x71,
         F3 => 0x72,
@@ -386,36 +754,32 @@ fn vk_from_egui_key(key: egui::Key) -> Option<u16> {
         F10 => 0x79,
         F11 => 0x7A,
         F12 => 0x7B,
-        // Navigation / editing.
-        Escape => 0x1B,     // VK_ESCAPE
-        Tab => 0x09,        // VK_TAB
-        Backspace => 0x08,  // VK_BACK
-        Enter => 0x0D,      // VK_RETURN
-        Space => 0x20,      // VK_SPACE
-        Insert => 0x2D,     // VK_INSERT
-        Delete => 0x2E,     // VK_DELETE
-        Home => 0x24,       // VK_HOME
-        End => 0x23,        // VK_END
-        PageUp => 0x21,     // VK_PRIOR
-        PageDown => 0x22,   // VK_NEXT
-        ArrowLeft => 0x25,  // VK_LEFT
-        ArrowUp => 0x26,    // VK_UP
-        ArrowRight => 0x27, // VK_RIGHT
-        ArrowDown => 0x28,  // VK_DOWN
-        // Punctuation (OEM keys, US layout).
-        Semicolon => 0xBA,                        // VK_OEM_1
-        Plus | Equals => 0xBB,                    // VK_OEM_PLUS
-        Comma => 0xBC,                            // VK_OEM_COMMA
-        Minus => 0xBD,                            // VK_OEM_MINUS
-        Period => 0xBE,                           // VK_OEM_PERIOD
-        Slash | Questionmark => 0xBF,             // VK_OEM_2
-        Backtick => 0xC0,                         // VK_OEM_3
-        OpenBracket | OpenCurlyBracket => 0xDB,   // VK_OEM_4
-        Backslash | Pipe => 0xDC,                 // VK_OEM_5
-        CloseBracket | CloseCurlyBracket => 0xDD, // VK_OEM_6
-        Quote => 0xDE,                            // VK_OEM_7
-        // Keys without a single stable US VK (Colon, Exclamationmark, Copy/Cut/Paste, F13+,
-        // BrowserBack, …) are ignored so capture waits for the next, mappable, press.
+        Escape => 0x1B,
+        Tab => 0x09,
+        Backspace => 0x08,
+        Enter => 0x0D,
+        Space => 0x20,
+        Insert => 0x2D,
+        Delete => 0x2E,
+        Home => 0x24,
+        End => 0x23,
+        PageUp => 0x21,
+        PageDown => 0x22,
+        ArrowLeft => 0x25,
+        ArrowUp => 0x26,
+        ArrowRight => 0x27,
+        ArrowDown => 0x28,
+        Semicolon => 0xBA,
+        Plus | Equals => 0xBB,
+        Comma => 0xBC,
+        Minus => 0xBD,
+        Period => 0xBE,
+        Slash | Questionmark => 0xBF,
+        Backtick => 0xC0,
+        OpenBracket | OpenCurlyBracket => 0xDB,
+        Backslash | Pipe => 0xDC,
+        CloseBracket | CloseCurlyBracket => 0xDD,
+        Quote => 0xDE,
         _ => return None,
     })
 }

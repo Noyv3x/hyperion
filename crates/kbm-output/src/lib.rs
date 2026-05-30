@@ -19,7 +19,21 @@
 //!
 //! The whole crate is `#![cfg(windows)]`; on other targets it compiles to an empty lib so the
 //! Linux CI `cargo check` of the workspace still type-checks the dependency graph.
+//!
+//! ## M4 additions
+//! * **Mouse**: relative-move (`MOUSEEVENTF_MOVE`), wheel (`MOUSEEVENTF_WHEEL`/`HWHEEL` in
+//!   `WHEEL_DELTA` units), and full mouse-button edges incl. `X1`/`X2` via `mouseData` — all batched
+//!   into the same single-`SendInput`-per-report scratch as keys, and lifted by
+//!   [`release_all`](KbmSink::release_all).
+//! * **Macro playback** ([`macro_player`]): a [`MacroPlayer`] the injector thread owns. The hot loop
+//!   only emits `KbmEvent::Macro` start/stop edges; the player holds the resolved profile's macro
+//!   definitions ([`MacroDef`]/[`MacroStep`]) and advances each in-flight macro's step schedule on a
+//!   timer, injecting through the same [`SendInputKbm`] so its edge-dedupe state is shared.
 #![cfg(windows)]
+
+pub mod macro_player;
+
+pub use macro_player::{MacroDef, MacroMouseButton, MacroPlayer, MacroStep};
 
 use hyperion_core::output::kbm::{KbmBatch, KbmEvent, KeyKind, MouseButton, KBM_BATCH_CAP};
 
@@ -204,9 +218,10 @@ impl SendInputKbm {
                             .push(mouse_wheel_input(MOUSEEVENTF_HWHEEL, horizontal));
                     }
                 }
-                // Macro playback timing is owned by the injector thread, not this mapping step;
-                // for M3 a macro edge has no per-event INPUT here (full playback is M4). Treated as
-                // a no-op so the crate compiles with no todo!/panic.
+                // Macro playback timing is owned by the injector thread's `MacroPlayer`
+                // ([`macro_player`]), NOT this per-report mapping step. The injector routes
+                // `KbmEvent::Macro` edges to `MacroPlayer::on_edge` before/after `flush`, so a macro
+                // edge that reaches `build_inputs` (e.g. mixed into a batch) stages no INPUT here.
                 KbmEvent::Macro { .. } => {}
                 // Special actions are routed to the control plane upstream and never reach the KBM
                 // injector; ignore defensively if one slips into a batch.
@@ -605,6 +620,57 @@ mod tests {
         let m = mi(&sink.scratch[0]);
         assert_eq!(m.dwFlags, MOUSEEVENTF_XDOWN);
         assert_eq!(m.mouseData, XBUTTON2);
+    }
+
+    #[test]
+    fn builds_all_mouse_event_kinds_into_scratch() {
+        // M4 mouse-injection contract: a synthetic batch carrying a relative move, both wheel axes,
+        // and every mouse button stages the right INPUT records (no real SendInput). Pins the
+        // MOUSEEVENTF flags + WHEEL_DELTA/XBUTTON packing for the mouse-from-stick / wheel / button
+        // bindings the M4 engine emits.
+        let mut sink = SendInputKbm::new();
+        let mut batch = KbmBatch::new();
+        batch.push(KbmEvent::MouseMove { dx: -7, dy: 11 });
+        batch.push(KbmEvent::Wheel {
+            vertical: 120,
+            horizontal: -120,
+        });
+        batch.push(KbmEvent::MouseButton {
+            btn: MouseButton::Middle,
+            down: true,
+        });
+        batch.push(KbmEvent::MouseButton {
+            btn: MouseButton::X1,
+            down: true,
+        });
+
+        // move(1) + wheel vert(1) + wheel horiz(1) + middle(1) + x1(1) == 5 records.
+        let n = sink.build_inputs(&batch);
+        assert_eq!(n, 5);
+
+        // [0] relative move carries the signed delta, no ABSOLUTE flag.
+        let mv = mi(&sink.scratch[0]);
+        assert_eq!(mv.dwFlags, MOUSEEVENTF_MOVE);
+        assert_eq!((mv.dx, mv.dy), (-7, 11));
+        // [1] vertical wheel (+120 == one notch up) via MOUSEEVENTF_WHEEL.
+        let wv = mi(&sink.scratch[1]);
+        assert_eq!(wv.dwFlags, MOUSEEVENTF_WHEEL);
+        assert_eq!(wv.mouseData as i32, 120);
+        // [2] horizontal wheel (-120) via MOUSEEVENTF_HWHEEL; the signed amount wraps into u32.
+        let wh = mi(&sink.scratch[2]);
+        assert_eq!(wh.dwFlags, MOUSEEVENTF_HWHEEL);
+        assert_eq!(wh.mouseData as i32, -120);
+        // [3] middle-button down.
+        assert_eq!(mi(&sink.scratch[3]).dwFlags, MOUSEEVENTF_MIDDLEDOWN);
+        // [4] X1 down selects the button via mouseData == XBUTTON1.
+        let x1 = mi(&sink.scratch[4]);
+        assert_eq!(x1.dwFlags, MOUSEEVENTF_XDOWN);
+        assert_eq!(x1.mouseData, XBUTTON1);
+
+        // release_all lifts the two held buttons (move/wheel hold nothing).
+        sink.stage_release_all();
+        assert_eq!(sink.scratch.len(), 2, "two held buttons released");
+        assert_eq!(sink.held_mouse, 0);
     }
 
     #[test]

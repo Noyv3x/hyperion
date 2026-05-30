@@ -42,6 +42,7 @@ use hyperion_core::stick::StickSample;
 use hyperion_core::trigger::{process_trigger, TriggerSettings, TriggerState};
 
 use crate::clock::DtTracker;
+use crate::control::{forward_specials, ControlPlaneEvent, ControlPlaneTx};
 use crate::handoff::{CommandRx, ConfigHandle, HotCommand, KbmTx, TelemetryTx};
 use crate::telemetry::{LatencyReservoir, TelemetryFrame};
 
@@ -138,6 +139,10 @@ pub struct HotThread<D, V> {
     telemetry: TelemetryTx,
     /// KBM egress producer to the injector thread (drop-on-full, never blocks — §7.3).
     kbm_tx: KbmTx,
+    /// Control-plane side channel (hot → supervisor): `Special` edges + the resolved macro table
+    /// (blueprint §5/§12 M4). Non-blocking `try_send`; a wedged control plane never stalls the hot
+    /// thread (a dropped event self-heals on the next edge / generation gate).
+    ctrl_tx: ControlPlaneTx,
 }
 
 /// The resident, alloc-free working set held across reports.
@@ -218,6 +223,7 @@ where
     V: VirtualPad,
 {
     /// Bundle the hot-thread inputs. Construction is off the hot path.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: D,
         target: V,
@@ -226,6 +232,7 @@ where
         commands: CommandRx,
         telemetry: TelemetryTx,
         kbm_tx: KbmTx,
+        ctrl_tx: ControlPlaneTx,
     ) -> Self {
         Self {
             device,
@@ -235,6 +242,7 @@ where
             commands,
             telemetry,
             kbm_tx,
+            ctrl_tx,
         }
     }
 
@@ -248,6 +256,9 @@ where
         let mut applied_gen: u64 = 0;
         let mut cfg: EngineConfig = (*self.config.load_full()).clone();
         let mut res = Resident::resolve(&cfg);
+        // Hand the initial macro table to the control plane (→ injector's MacroPlayer). Re-sent on
+        // every profile change below so the player always has the active profile's macros.
+        self.publish_macros(&res);
         let mut dropped_total: u32 = 0;
         let mut duplicates_total: u32 = 0;
         let mut kbm_dropped_total: u32 = 0;
@@ -282,6 +293,9 @@ where
                 cfg = (*self.config.load_full()).clone();
                 res.reresolve(&cfg);
                 applied_gen = cur_gen;
+                // A profile (re)assignment or macro edit may have changed the macro table; re-publish
+                // it to the injector off the per-report path (this runs only on the generation gate).
+                self.publish_macros(&res);
             }
 
             let dt = Dt::guarded(input.dt_us);
@@ -339,9 +353,14 @@ where
                 // `now_us` reuses the existing clock read (verifier latency FIX 3) — no 2nd QPC.
                 let now_us = busy_start / 1000;
                 let (out, kbm) = apply(&state, &res.resolved, &mut res.map_state, now_us);
-                // Push the KBM batch non-blocking; drop-on-full (never wedge the hot thread).
-                if !kbm.is_empty() && !self.kbm_tx.push(kbm) {
-                    kbm_dropped_total = kbm_dropped_total.wrapping_add(1);
+                // Route `Special` rising edges OUT of the KBM batch to the control plane (profile
+                // switch etc. run off the hot path, §5/§12 M4). The key/mouse/macro edges still go
+                // to the injector ring (it ignores `Special` defensively). Both are non-blocking.
+                if !kbm.is_empty() {
+                    forward_specials(&kbm, &self.ctrl_tx);
+                    if !self.kbm_tx.push(kbm) {
+                        kbm_dropped_total = kbm_dropped_total.wrapping_add(1);
+                    }
                 }
                 out
             };
@@ -374,6 +393,17 @@ where
             // `busy.p99_us()` / `kbm_dropped_total` / `input.host_qpc_ns` feed the M2+ scope.
             let _ = kbm_dropped_total;
         }
+    }
+
+    /// Republish the resident profile's macro table to the control plane (→ injector's
+    /// `MacroPlayer`). Called on start and on every generation gate, **never** per report. The
+    /// `Arc<[MacroDef]>` clone is a refcount bump; a full/closed channel drops the publish (the next
+    /// gate re-sends), so this never blocks the hot thread.
+    #[inline]
+    fn publish_macros(&self, res: &Resident) {
+        let _ = self
+            .ctrl_tx
+            .try_send(ControlPlaneEvent::Macros(res.resolved.macros.clone()));
     }
 }
 
@@ -890,6 +920,36 @@ mod tests {
             res.stick_state[0].rc_primed,
             "live filter state is preserved"
         );
+    }
+
+    #[test]
+    fn special_binding_routes_to_control_plane() {
+        // Options -> Special(2). The general path produces a Special edge in the batch; the hot loop
+        // forwards it to the control plane via `forward_specials` (tested in `control`). Here we pin
+        // that the batch carries the edge so the routing has something to forward.
+        use hyperion_core::map::BindTarget;
+        let mut p = Profile::default();
+        p.bindings.insert(
+            Control::Options,
+            hyperion_core::map::BindingSlot::from_bind(BindTarget::Special(2)),
+        );
+        let (_cfg, mut res) = resident_for(p);
+        assert!(!res.passthrough_only);
+        // Options is btn1 0x20; hat neutral = btn0 0x08.
+        let down = HotInput {
+            raw_buttons: 0x08 | (0x20u32 << 8),
+            is_prime: false,
+            ..HotInput::default()
+        };
+        let (_f, kbm) = step(&mut res, &down);
+        let batch = kbm.expect("general path emits a batch");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let n = crate::control::forward_specials(&batch, &tx);
+        assert_eq!(n, 1, "one Special edge forwarded off the hot path");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::control::ControlPlaneEvent::Special(2))
+        ));
     }
 
     #[test]

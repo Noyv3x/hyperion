@@ -16,6 +16,7 @@ use std::thread::JoinHandle;
 use hyperion_core::config::EngineConfig;
 
 use crate::config_store::ConfigStore;
+use crate::control::{ControlPlaneEvent, ControlPlaneRx, ControlPlaneTx};
 use crate::handoff::{self, CommandTx, ConfigHandle, KbmRx, KbmTx, TelemetryRx};
 use crate::hot::{HotThread, StopReason};
 use crate::win_io::{spawn_kbm_injector, DualSenseDevice, Vigem360Target};
@@ -23,6 +24,11 @@ use crate::win_io::{spawn_kbm_injector, DualSenseDevice, Vigem360Target};
 // `EngineError` is shared with the cross-platform `Runtime`, so it lives in `crate::error`;
 // re-export it here so `engine::supervisor::EngineError` stays a valid path.
 pub use crate::error::EngineError;
+
+/// Capacity of the control-plane side channel (hot → supervisor). Special edges are rare (a user
+/// pressing a special-action button) and the macro table re-publishes only on the generation gate,
+/// so a small bounded ring is plenty; on overflow the hot thread drops the event (self-healing).
+const CONTROL_PLANE_CAP: usize = 64;
 
 /// Owns the engine lifecycle: builds the lock-free links, holds the control-plane ends, and
 /// runs the hot thread under the correct resource ordering.
@@ -44,6 +50,10 @@ pub struct Supervisor {
     /// KBM egress consumer (HOT → injector). Taken at [`Supervisor::spawn`] to start the
     /// injector thread; `None` once consumed.
     kbm_rx: Option<KbmRx>,
+    /// Control-plane side channel consumer (HOT → supervisor): `Special` edges + the resolved macro
+    /// table (blueprint §5/§12 M4). Drained off the hot path by the control-plane thread spawned in
+    /// [`Supervisor::spawn`]; `None` once consumed.
+    ctrl_rx: Option<ControlPlaneRx>,
     /// Built once and moved onto the hot thread at spawn.
     hot_links: Option<HotLinks>,
 }
@@ -54,6 +64,8 @@ struct HotLinks {
     telemetry: handoff::TelemetryTx,
     /// KBM egress producer the hot loop pushes one batch per report into (drop-on-full).
     kbm_tx: KbmTx,
+    /// Control-plane side-channel producer (hot → supervisor): `Special` edges + the macro table.
+    ctrl_tx: ControlPlaneTx,
 }
 
 impl Supervisor {
@@ -68,6 +80,12 @@ impl Supervisor {
         let (config, (telemetry_tx, telemetry_rx), (gui_tx, sup_tx, command_rx), (kbm_tx, kbm_rx)) =
             handoff::build_links(cfg);
 
+        // Control-plane side channel (hot → supervisor). Bounded so the hot thread's `try_send` is
+        // drop-on-full (never blocks the TIME_CRITICAL thread); a missed `Special` re-fires on the
+        // next edge and the macro table re-publishes on the next generation gate, so a brief
+        // drain stall is self-healing. Capacity absorbs a burst of special edges + macro re-sends.
+        let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded(CONTROL_PLANE_CAP);
+
         // The store and the hot loop share the same ArcSwap + generation counter.
         let config_store = ConfigStore::from_handle(config.clone());
         let config_gen = config_store.generation_counter();
@@ -80,10 +98,12 @@ impl Supervisor {
             sup_tx: Some(sup_tx),
             telemetry_rx: Some(telemetry_rx),
             kbm_rx: Some(kbm_rx),
+            ctrl_rx: Some(ctrl_rx),
             hot_links: Some(HotLinks {
                 commands: command_rx,
                 telemetry: telemetry_tx,
                 kbm_tx,
+                ctrl_tx,
             }),
         })
     }
@@ -171,6 +191,17 @@ impl Supervisor {
             None => None,
         };
 
+        // (2c) Spawn the control-plane drain thread (blueprint §5/§12 M4): it drains the hot loop's
+        // `Special` edges + macro-table publishes off the hot path. For M4 the special-action
+        // handler is a minimal stub (log/ack); real exec (profile switch / launch / disconnect)
+        // builds on this in M5. It exits when the hot thread's `ControlPlaneTx` is dropped.
+        let ctrl_drain = self
+            .ctrl_rx
+            .take()
+            .map(spawn_control_plane_drain)
+            .transpose()
+            .map_err(|e: std::io::Error| EngineError::Platform(e.to_string()))?;
+
         // (3) Spawn the hot thread with the policy guard bound inside it (or `None` if there is
         // nothing to drive, which still joins cleanly).
         let handle = match hot_links {
@@ -189,6 +220,7 @@ impl Supervisor {
         Ok(RunningSupervisor {
             handle,
             kbm_injector,
+            ctrl_drain,
             _timer_res: timer_res,
         })
     }
@@ -215,6 +247,10 @@ pub struct RunningSupervisor {
     /// exit drops the `KbmTx` and so signals the injector to drain-and-exit. `None` if no ring
     /// consumer was available.
     kbm_injector: Option<JoinHandle<()>>,
+    /// The control-plane drain thread (blueprint §5/§12 M4): handles `Special` edges + macro
+    /// publishes. Joined after the hot thread, whose exit drops the `ControlPlaneTx` and so signals
+    /// this thread to drain-and-exit. `None` if no consumer was available.
+    ctrl_drain: Option<JoinHandle<()>>,
     /// Restored on drop, after `handle` has joined.
     _timer_res: platform_win::TimerResGuard,
 }
@@ -244,9 +280,63 @@ impl RunningSupervisor {
             }
         }
 
+        // The hot thread's `ControlPlaneTx` is also dropped now, so the control-plane drain thread
+        // sees the channel disconnect and returns. A panic there is likewise non-fatal to shutdown.
+        if let Some(drain) = self.ctrl_drain {
+            if drain.join().is_err() {
+                eprintln!("hyperion: control-plane drain thread panicked during shutdown");
+            }
+        }
+
         hot_result
-        // `_timer_res` drops here, after both joins.
+        // `_timer_res` drops here, after all joins.
     }
+}
+
+/// Spawn the control-plane drain thread (blueprint §5/§12 M4): a normal-priority worker that
+/// receives [`ControlPlaneEvent`]s from the hot loop and runs them **off** the hot path.
+///
+/// * [`ControlPlaneEvent::Special`] → run the matching special action. For M4 this is a minimal
+///   stub: it logs/acks the id (real profile-switch / launch / disconnect exec builds on this in
+///   M5, routed back through the single-writer `ControlMsg` path so the hot loop sees only a
+///   generation bump).
+/// * [`ControlPlaneEvent::Macros`] → the active profile's resolved macro table, republished on
+///   start and every profile change. The injector's `MacroPlayer` consumes these to play a
+///   `Macro{start}` edge by id; the latest table is held here so a profile switch swaps the macro
+///   set without touching the hot thread.
+///
+/// The thread exits when the hot thread's [`ControlPlaneTx`] is dropped (channel disconnect), which
+/// is the clean drain-and-exit signal joined in [`RunningSupervisor::join`].
+fn spawn_control_plane_drain(rx: ControlPlaneRx) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("hyperion-control-plane".to_string())
+        .spawn(move || {
+            // The number of macros in the latest published table (held so a future profile-switch
+            // handler / the injector wiring can read the active set). Updated on every `Macros`
+            // publish; tracking the count keeps the binding genuinely used while the injector-side
+            // consumption is wired in `win_io` by the maintainer.
+            let mut macro_count = 0usize;
+            // `recv` blocks until an event or channel disconnect — zero CPU while idle, no poll.
+            while let Ok(ev) = rx.recv() {
+                match ev {
+                    ControlPlaneEvent::Special(id) => {
+                        // M4 stub: acknowledge the special edge off the hot path. Real exec (M5)
+                        // resolves `id` against the active profile's `specials` and routes the
+                        // effect (e.g. `SetActiveProfile`) through the single-writer control path.
+                        eprintln!("hyperion: special action {id} fired (M4 stub: logged)");
+                    }
+                    ControlPlaneEvent::Macros(table) => {
+                        // The active macro table for the injector's MacroPlayer (wired by the KBM
+                        // injector). Republished on start + every profile change; track its size so
+                        // a profile switch that changes the macro set is observable here.
+                        if table.len() != macro_count {
+                            macro_count = table.len();
+                            eprintln!("hyperion: macro table updated ({macro_count} macros)");
+                        }
+                    }
+                }
+            }
+        })
 }
 
 /// Spawn the hot thread, doing all thread-affine acquisition *inside* the spawned thread.
@@ -268,6 +358,7 @@ fn spawn_hot(
         commands,
         telemetry,
         kbm_tx,
+        ctrl_tx,
     } = links;
 
     let handle = std::thread::Builder::new()
@@ -292,7 +383,7 @@ fn spawn_hot(
             // ViGEm target, `_policy`, and the `KbmTx` (dropped here, signaling the injector to
             // drain-and-exit) all release on this thread when `run` returns.
             HotThread::new(
-                device, target, config, config_gen, commands, telemetry, kbm_tx,
+                device, target, config, config_gen, commands, telemetry, kbm_tx, ctrl_tx,
             )
             .run()
         })

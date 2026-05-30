@@ -20,6 +20,7 @@ pub mod convert;
 pub mod dt;
 pub mod input;
 pub mod map;
+pub mod mouse_accum;
 pub mod output;
 pub mod rc;
 pub mod stick;

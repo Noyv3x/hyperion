@@ -314,8 +314,20 @@ fn edit_in_place(cfg: &mut EngineConfig, msg: &ControlMsg) {
                 slot.shift_bind = *bind;
             }
         }
+        ControlMsg::SetBindingTurbo {
+            profile,
+            control,
+            turbo,
+        } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                p.bindings
+                    .entry(*control)
+                    .or_insert_with(BindingSlot::default)
+                    .turbo = *turbo;
+            }
+        }
 
-        // ---- Stick / trigger settings ----
+        // ---- Stick / trigger / mouse settings ----
         ControlMsg::SetStickSettings {
             profile,
             stick,
@@ -337,21 +349,59 @@ fn edit_in_place(cfg: &mut EngineConfig, msg: &ControlMsg) {
                 }
             }
         }
-
-        // ---- M4/M5 surface: accepted-but-no-op in M3 ----
-        // The variants exist so the GUI / writer compile against the full message surface; their
-        // config-tree mutation (macros, special actions) and the hot-loop consumers land in
-        // M4/M5. Accepting them as no-ops keeps the single-writer contract uniform.
-        ControlMsg::UpsertMacro { .. }
-        | ControlMsg::DeleteMacro { .. }
-        | ControlMsg::UpsertSpecialAction { .. }
-        | ControlMsg::DeleteSpecialAction { .. }
-        | ControlMsg::SetAutoSwitchEnabled(_) => { /* TODO(M4/M5): mutate macros/specials/auto-switch */
+        ControlMsg::SetMouseSettings { profile, settings } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                p.mouse = *settings;
+            }
         }
+
+        // ---- Macros / special actions (M4): mutate the active profile's id-keyed Vecs ----
+        // The `id` field is the logical key; an upsert replaces the entry with the matching id (or
+        // appends a new one), a delete drops it. Kept as sorted-by-id Vecs so the on-disk form is
+        // stable and a re-serialize is deterministic (the no-change TOML compare then works).
+        ControlMsg::UpsertMacro { profile, def } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                upsert_by_id(&mut p.macros, def.clone(), |m| m.id, def.id);
+            }
+        }
+        ControlMsg::DeleteMacro { profile, id } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                p.macros.retain(|m| m.id != *id);
+            }
+        }
+        ControlMsg::UpsertSpecialAction { profile, action } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                upsert_by_id(&mut p.specials, action.clone(), |a| a.id, action.id);
+            }
+        }
+        ControlMsg::DeleteSpecialAction { profile, id } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                p.specials.retain(|a| a.id != *id);
+            }
+        }
+
+        // ---- M5 surface: accepted-but-no-op (consumer lands in M5) ----
+        ControlMsg::SetAutoSwitchEnabled(_) => { /* TODO(M5): toggle auto-switch */ }
 
         // Disk messages are handled before this function is reached.
         ControlMsg::SaveToDisk | ControlMsg::ReloadFromDisk => {}
     }
+}
+
+/// Insert-or-replace `item` in an id-keyed `Vec`. If an element with `id` already exists it is
+/// replaced in place; otherwise the item is inserted at the first position whose id is greater, so
+/// a Vec that starts sorted stays sorted (a stable on-disk form). Correct regardless of the input
+/// ordering (a linear find, not a binary search — these Vecs are tiny and the path is cold).
+///
+/// `key` extracts an element's id; `id` is `item`'s id (passed separately so the closure need not
+/// borrow `item`, which is moved on insert).
+fn upsert_by_id<T, K: Fn(&T) -> u16>(vec: &mut Vec<T>, item: T, key: K, id: u16) {
+    if let Some(slot) = vec.iter_mut().find(|e| key(e) == id) {
+        *slot = item; // existing id: replace in place.
+        return;
+    }
+    let pos = vec.iter().position(|e| key(e) > id).unwrap_or(vec.len());
+    vec.insert(pos, item); // new id: keep a sorted Vec sorted.
 }
 
 /// Mutable borrow of the profile assigned to `device` (via `EngineConfig::assignments`), through
@@ -700,16 +750,199 @@ mod tests {
     }
 
     #[test]
-    fn m4_m5_messages_are_accepted_noops() {
+    fn m5_messages_are_accepted_noops() {
         let store = store_with_profile();
         let g0 = store.generation();
-        // A macro upsert is accepted but does nothing in M3 (no panic, no bump).
+        // Deleting a macro that does not exist is a no-op (no panic, no bump).
         assert!(!store.apply(&ControlMsg::DeleteMacro {
             profile: "default".to_string(),
             id: 1,
         }));
+        // Auto-switch toggle is still an M5 placeholder no-op.
         assert!(!store.apply(&ControlMsg::SetAutoSwitchEnabled(true)));
         assert_eq!(store.generation(), g0);
+    }
+
+    #[test]
+    fn apply_upsert_then_delete_macro_mutates_profile() {
+        use hyperion_core::map::profile::{MacroDef, MacroStep};
+        let store = store_with_profile();
+        let g0 = store.generation();
+
+        let def = MacroDef {
+            id: 7,
+            name: "reload".to_string(),
+            repeat: false,
+            steps: vec![
+                MacroStep::KeyDown {
+                    vk: 0x52,
+                    scan_code: true,
+                },
+                MacroStep::Wait { ms: 25 },
+                MacroStep::KeyUp {
+                    vk: 0x52,
+                    scan_code: true,
+                },
+            ],
+        };
+        assert!(store.apply(&ControlMsg::UpsertMacro {
+            profile: "default".to_string(),
+            def: def.clone(),
+        }));
+        let snap = store.snapshot();
+        assert_eq!(snap.profiles["default"].macros.len(), 1);
+        assert_eq!(snap.profiles["default"].macros[0], def);
+        assert_eq!(store.generation(), g0 + 1);
+
+        // Upserting the same id replaces it (no duplicate appended).
+        let def2 = MacroDef {
+            name: "reload-fast".to_string(),
+            ..def
+        };
+        assert!(store.apply(&ControlMsg::UpsertMacro {
+            profile: "default".to_string(),
+            def: def2.clone(),
+        }));
+        let snap = store.snapshot();
+        assert_eq!(
+            snap.profiles["default"].macros.len(),
+            1,
+            "same id replaces, not appends"
+        );
+        assert_eq!(snap.profiles["default"].macros[0].name, "reload-fast");
+
+        // Delete drops it.
+        assert!(store.apply(&ControlMsg::DeleteMacro {
+            profile: "default".to_string(),
+            id: 7,
+        }));
+        assert!(store.snapshot().profiles["default"].macros.is_empty());
+    }
+
+    #[test]
+    fn apply_upsert_macros_stay_sorted_by_id() {
+        use hyperion_core::map::profile::MacroDef;
+        let store = store_with_profile();
+        for id in [9u16, 2, 5] {
+            let def = MacroDef {
+                id,
+                name: format!("m{id}"),
+                ..MacroDef::default()
+            };
+            assert!(store.apply(&ControlMsg::UpsertMacro {
+                profile: "default".to_string(),
+                def,
+            }));
+        }
+        let snap = store.snapshot();
+        let ids: Vec<u16> = snap.profiles["default"]
+            .macros
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![2, 5, 9],
+            "macros stay sorted by id for a stable on-disk form"
+        );
+    }
+
+    #[test]
+    fn apply_upsert_then_delete_special_action() {
+        use hyperion_core::map::SpecialAction;
+        let store = store_with_profile();
+        let action = SpecialAction {
+            id: 3,
+            name: "switch-profile".to_string(),
+        };
+        assert!(store.apply(&ControlMsg::UpsertSpecialAction {
+            profile: "default".to_string(),
+            action: action.clone(),
+        }));
+        assert_eq!(store.snapshot().profiles["default"].specials, vec![action]);
+        assert!(store.apply(&ControlMsg::DeleteSpecialAction {
+            profile: "default".to_string(),
+            id: 3,
+        }));
+        assert!(store.snapshot().profiles["default"].specials.is_empty());
+    }
+
+    #[test]
+    fn apply_set_mouse_settings_mutates_and_resolves_clamped() {
+        use hyperion_core::map::MouseSettings;
+        let store = store_with_profile();
+        let settings = MouseSettings {
+            sensitivity: 9_999.0, // above the 100 clamp
+            invert_y: true,
+            ..MouseSettings::default()
+        };
+        assert!(store.apply(&ControlMsg::SetMouseSettings {
+            profile: "default".to_string(),
+            settings,
+        }));
+        // The editable profile carries the user's typed value; the hot-facing resolved form is the
+        // clamped one `apply()` consumes (resolve() runs MouseSettings::clamped()).
+        let snap = store.snapshot();
+        assert!(snap.profiles["default"].mouse.invert_y);
+        let resolved = snap.resolved["dev"].mouse;
+        assert_eq!(
+            resolved.sensitivity, 100.0,
+            "resolved mouse sensitivity clamped"
+        );
+        assert!(resolved.invert_y);
+    }
+
+    #[test]
+    fn apply_set_binding_turbo_inserts_slot() {
+        use hyperion_core::map::TurboCfg;
+        let store = store_with_profile();
+        let turbo = TurboCfg {
+            period_us: 80_000,
+            duty_num: 1,
+            duty_den: 3,
+        };
+        assert!(store.apply(&ControlMsg::SetBindingTurbo {
+            profile: "default".to_string(),
+            control: Control::R2,
+            turbo: Some(turbo),
+        }));
+        assert_eq!(
+            store.snapshot().profiles["default"].bindings[&Control::R2].turbo,
+            Some(turbo)
+        );
+        // Clearing turbo sets it back to None.
+        assert!(store.apply(&ControlMsg::SetBindingTurbo {
+            profile: "default".to_string(),
+            control: Control::R2,
+            turbo: None,
+        }));
+        assert_eq!(
+            store.snapshot().profiles["default"].bindings[&Control::R2].turbo,
+            None
+        );
+    }
+
+    #[test]
+    fn apply_set_shift_trigger_mutates_slot() {
+        use hyperion_core::map::ShiftTrigger;
+        let store = store_with_profile();
+        assert!(store.apply(&ControlMsg::SetShiftTrigger {
+            profile: "default".to_string(),
+            control: Control::Cross,
+            trigger: Some(ShiftTrigger {
+                control: Control::L1,
+            }),
+            bind: BindTarget::GamepadButton(PadBtn::Y),
+        }));
+        let snap = store.snapshot();
+        let slot = &snap.profiles["default"].bindings[&Control::Cross];
+        assert_eq!(
+            slot.shift_trigger,
+            Some(ShiftTrigger {
+                control: Control::L1
+            })
+        );
+        assert_eq!(slot.shift_bind, BindTarget::GamepadButton(PadBtn::Y));
     }
 
     #[test]

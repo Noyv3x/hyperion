@@ -6,18 +6,38 @@
 //! keyboard/mouse edges into a [`KbmBatch`]. It runs inline on the hot loop exactly where the
 //! single `RcFilter` step ran (blueprint §7.2).
 //!
-//! ## M3 subset
-//! M3 implements the spine: per-kind **digitize** (thresholds 55/127 vs 100/255 via
+//! ## M3 subset (now extended by M4)
+//! M3 implemented the spine: per-kind **digitize** (thresholds 55/127 vs 100/255 via
 //! [`ControllerState::pressed`]), **half-axis identity suppression** (the `axis_remapped[4]` pass
 //! — verifier FIX 1), and per-control resolve for **`Passthrough` + `GamepadButton` + `Key`**
-//! (button→button, button→key with an edge/toggle vk-keyed latch — verifier FIX 6). Every other
-//! `BindTarget` is a clearly-marked `TODO(M4)`/`TODO(M5)` no-op arm (NO `todo!()`/panic) so M4 is
-//! additive. Shift/turbo are read off the resolved slot but not yet applied in M3.
+//! (button→button, button→key with an edge/toggle vk-keyed latch — verifier FIX 6).
+//!
+//! ## M4 additions (blueprint §5, §12 M4)
+//! * **Per-control shift selection** (step 2, verifier FIX 4b): each control's effective slot is its
+//!   `shift_bind` when its `shift_trigger` reads pressed in the RAW digitized state, else its base
+//!   bind. Reads RAW only (never output → no feedback); supports distinct simultaneous triggers.
+//! * **Turbo** ([`turbo_gate`]): the per-control `on` is gated through the slot's [`TurboCfg`] with
+//!   the phase anchored to press time (net-new, no DS4Windows golden — verifier FIX 2).
+//! * **Mouse**: `Mouse(button)` → edge → [`KbmEvent::MouseButton`]; `MouseMove(src)` → feed the
+//!   resident [`MouseAccumulator`] → [`KbmEvent::MouseMove`] (verifier FIX 7); `MouseWheel(dir)` →
+//!   notch remainder → [`KbmEvent::Wheel`].
+//! * **Macro**: `Macro(id)` → on/off edge → [`KbmEvent::Macro`].
+//! * **Special**: `Special(id)` → edge → [`KbmEvent::Special`] (drained by the control plane).
+//! * **`GamepadAxis` / `TouchpadClick`**: digital→axis push and the touchpad output bit.
 
-use crate::input::{Control, ControllerState};
-use crate::map::binding::{BindTarget, KeyKind};
+use crate::input::{Control, ControlKind, ControllerState};
+use crate::map::binding::{
+    AxisDir, BindTarget, BindingSlot, GamepadAxis, KeyKind, MouseMoveSrc, TurboCfg, WheelDir,
+};
 use crate::map::profile::ResolvedProfile;
-use crate::output::{KbmBatch, KbmEvent, KeyKind as InjectKind, OutputState};
+use crate::mouse_accum::MouseAccumCfg;
+use crate::output::{KbmBatch, KbmEvent, KeyKind as InjectKind, MouseButton, OutputState};
+
+/// Re-export the real [`MouseAccumulator`](crate::mouse_accum::MouseAccumulator) so the historical
+/// `map::engine::MouseAccumulator` / `map::MouseAccumulator` paths (and [`MapState`]'s fields) keep
+/// resolving after the M4 implementation moved into [`crate::mouse_accum`]. The M3 placeholder that
+/// lived here is gone; this is the single source of truth.
+pub use crate::mouse_accum::MouseAccumulator;
 
 /// Fixed-capacity vk→bool latch (verifier FIX 6) — alloc-free, `Copy`.
 ///
@@ -111,24 +131,6 @@ pub struct TurboState {
     pub cycle_start_us: u64,
 }
 
-/// M3 placeholder for the stick/gyro mouse remainder-carry accumulator (real impl lands in
-/// `core/src/mouse_accum.rs` for M4/M5 per blueprint §6.2). Carried in [`MapState`] now so the
-/// field layout is stable and M4 is additive; inert in M3.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct MouseAccumulator {
-    h_remainder: f64,
-    v_remainder: f64,
-}
-
-impl MouseAccumulator {
-    /// Clear the carried remainder.
-    #[inline]
-    pub fn reset(&mut self) {
-        self.h_remainder = 0.0;
-        self.v_remainder = 0.0;
-    }
-}
-
 /// Resident mapping state — all `Copy`, all fixed-size arrays, **no heap on the hot path**
 /// (blueprint §5). `Default` is the clean post-reset state (verifier FIX 6): the engine's
 /// `ResetFilter` command sets `*ms = MapState::default()`.
@@ -148,6 +150,11 @@ pub struct MapState {
     pub toggle: VkLatch,
     /// vk→pressed-once edge guard (verifier FIX 6).
     pub pressed_once: VkLatch,
+    /// `now_us` of the previous [`apply`] call, used to derive the per-report `dt` the mouse
+    /// accumulator needs (the `apply()` signature carries only `now_us`, so the interval is
+    /// reconstructed here — see [`apply`]'s mouse-move handling). `0` means "no previous report"
+    /// (first call → a `dt` of 0 → the offset term is the only contribution, matching a cold start).
+    pub prev_now_us: u64,
 }
 
 impl Default for MapState {
@@ -155,11 +162,12 @@ impl Default for MapState {
         Self {
             turbo: [TurboState::default(); Control::COUNT],
             prev_active: [false; Control::COUNT],
-            stick_mouse: MouseAccumulator::default(),
-            gyro_mouse: MouseAccumulator::default(),
+            stick_mouse: MouseAccumulator::new(),
+            gyro_mouse: MouseAccumulator::new(),
             wheel_remainder: 0.0,
             toggle: VkLatch::new(),
             pressed_once: VkLatch::new(),
+            prev_now_us: 0,
         }
     }
 }
@@ -230,21 +238,190 @@ fn resolve_key(
     }
 }
 
+/// The net-new turbo / rapid-fire gate (blueprint §5, verifier FIX 2 — no DS4Windows golden).
+///
+/// While the source is held, the output toggles ON/OFF on a `period_us` cycle with an ON fraction
+/// of `duty_num/duty_den`. The phase is **anchored to the press time** (`cycle_start_us` reset on
+/// each rising edge) so a fresh press always begins with a full ON window. No float and no division
+/// on the gate decision — the duty comparison is a single `u128` cross-multiply. Releasing the
+/// source clears `was_active`, so the next press re-anchors.
+#[inline]
+fn turbo_gate(ts: &mut TurboState, src_on: bool, t: TurboCfg, now_us: u64) -> bool {
+    if !src_on {
+        ts.was_active = false;
+        return false;
+    }
+    if !ts.was_active {
+        ts.cycle_start_us = now_us;
+        ts.was_active = true;
+    }
+    let period = t.period_us.max(1) as u64;
+    let phase = now_us.wrapping_sub(ts.cycle_start_us) % period;
+    // ON while phase/period < duty_num/duty_den, i.e. phase·duty_den < period·duty_num. u128 to
+    // avoid overflow on large periods (period_us up to ~4e9, duty_den up to 65535).
+    u128::from(phase) * u128::from(t.duty_den) < u128::from(period) * u128::from(t.duty_num)
+}
+
+/// Select a control's **effective** binding under the per-control shift model (blueprint §5 step 2,
+/// verifier FIX 4b). If the slot carries a `shift_trigger` whose control reads pressed in the RAW
+/// digitized state, the `shift_bind` applies; otherwise the base `bind`. Reads RAW only — never
+/// output — so there is no feedback loop, and distinct controls can be shifted by distinct triggers
+/// simultaneously.
+#[inline]
+fn effective_bind(slot: &BindingSlot, active_raw: &[bool; Control::COUNT]) -> BindTarget {
+    match slot.shift_trigger {
+        Some(trig) if active_raw[trig.control.as_index()] => slot.shift_bind,
+        _ => slot.bind,
+    }
+}
+
+/// Push a digital→axis deflection into `out` for a `GamepadAxis` binding. A digital `on` source
+/// drives the axis fully toward `dir`. `full` is reserved for a future scaled-push variant for
+/// analog sources; a digital edge always pushes ±1 (the analog passthrough path owns continuous
+/// axes), so it is accepted-and-ignored here for signature stability.
+#[inline]
+fn resolve_gamepad_axis(
+    out: &mut OutputState,
+    axis: GamepadAxis,
+    dir: AxisDir,
+    full: bool,
+    on: bool,
+) {
+    let _ = full;
+    if !on {
+        return;
+    }
+    let signed = match dir {
+        AxisDir::Pos => 1.0,
+        AxisDir::Neg => -1.0,
+    };
+    match axis {
+        GamepadAxis::Lx => out.lx = signed,
+        GamepadAxis::Ly => out.ly = signed,
+        GamepadAxis::Rx => out.rx = signed,
+        GamepadAxis::Ry => out.ry = signed,
+        // Triggers are unipolar [0,1]: a push is full-on regardless of the dir sign.
+        GamepadAxis::Lt => out.lt = 1.0,
+        GamepadAxis::Rt => out.rt = 1.0,
+        GamepadAxis::Unknown => {}
+    }
+}
+
+/// Resolve a mouse-move binding: feed the resident [`MouseAccumulator`] from the named source's
+/// signed stick deflection (or gyro rate) and push the integer `(dx, dy)` as a [`KbmEvent::MouseMove`]
+/// (verifier FIX 7). Emits nothing when the delta is `(0, 0)` so the batch stays sparse.
+#[inline]
+fn resolve_mouse_move(
+    src: MouseMoveSrc,
+    state: &ControllerState,
+    cfg: &MouseAccumCfg,
+    elapsed_s: f64,
+    ms: &mut MapState,
+    batch: &mut KbmBatch,
+) {
+    let (dx, dy) = match src {
+        MouseMoveSrc::LeftStick => ms
+            .stick_mouse
+            .stick_step(state.lx, state.ly, elapsed_s, cfg),
+        MouseMoveSrc::RightStick => ms
+            .stick_mouse
+            .stick_step(state.rx, state.ry, elapsed_s, cfg),
+        MouseMoveSrc::Gyro => {
+            // Gyro yaw → dx, pitch → dy (the M5 scaling owner lives in the gyro settings; here we
+            // pass the raw rad/s rate through the same carry path so the wiring is exercised).
+            ms.gyro_mouse.gyro_step(
+                state.motion.gyro_yaw,
+                state.motion.gyro_pitch,
+                elapsed_s,
+                cfg,
+            )
+        }
+        MouseMoveSrc::Unknown => (0, 0),
+    };
+    if dx != 0 || dy != 0 {
+        batch.push(KbmEvent::MouseMove { dx, dy });
+    }
+}
+
+/// Resolve a mouse-wheel binding while the source is held: accumulate a fractional notch into
+/// `ms.wheel_remainder` and emit whole `WHEEL_DELTA` (±120) ticks (ports DS4Windows
+/// `GetMouseWheelMapping`/`stickWheelRemainder`). A full deflection scrolls ~one notch per three
+/// reports; partial deflection scrolls proportionally slower. Off-edge resets the remainder.
+#[inline]
+fn resolve_mouse_wheel(
+    dir: WheelDir,
+    on: bool,
+    prev_on: bool,
+    ms: &mut MapState,
+    batch: &mut KbmBatch,
+) {
+    if !on {
+        if prev_on {
+            ms.wheel_remainder = 0.0;
+        }
+        return;
+    }
+    // C#: ratio = (1-0.05)*(value/255)+0.05, currentWheel = ratio/3. A held digital source is
+    // value==255 → ratio==1 → 1/3 of a notch per report; three reports == one tick.
+    let current = 1.0 / 3.0;
+    let wheel = current + ms.wheel_remainder;
+    if wheel >= 1.0 {
+        let ticks = wheel.trunc();
+        ms.wheel_remainder = wheel - ticks;
+        let notches = ticks as i32 * 120;
+        let (vertical, horizontal) = match dir {
+            WheelDir::Up => (notches, 0),
+            WheelDir::Down => (-notches, 0),
+            WheelDir::Right => (0, notches),
+            WheelDir::Left => (0, -notches),
+            WheelDir::Unknown => (0, 0),
+        };
+        if vertical != 0 || horizontal != 0 {
+            batch.push(KbmEvent::Wheel {
+                vertical,
+                horizontal,
+            });
+        }
+    } else {
+        ms.wheel_remainder = wheel;
+    }
+}
+
+/// Resolve the mouse settings carried by the resolved profile into the accumulator's tunable form.
+///
+/// **Integration note (blueprint §3/§7):** `ResolvedProfile` does not yet carry a resolved
+/// `mouse: MouseSettings` field — `profile.rs` (owned by the integration agent) holds an empty
+/// `MouseSettings {}` placeholder. Until that field + its `MouseSettings → MouseAccumCfg`
+/// projection land, `apply()` uses [`MouseAccumCfg::default`] (DS4Windows-class defaults). When the
+/// field is added, replace this with `rp.mouse.to_accum_cfg()` (or read the individual tunables).
+#[inline]
+fn mouse_cfg(_rp: &ResolvedProfile) -> MouseAccumCfg {
+    MouseAccumCfg::default()
+}
+
 /// Pure, alloc-free, no-I/O remap entry point (blueprint §5).
 ///
 /// Resolves every `Control` against `rp`, composing an [`OutputState`] and queueing KBM edges.
 /// `now_us` is the hot loop's monotonic time (reused from `busy_start/1000`).
 ///
-/// M3: digitize + half-axis identity suppression + `Passthrough`/`GamepadButton`/`Key`. Other
-/// `BindTarget`s are `TODO` no-ops.
+/// Resolution order (blueprint §5): digitize once → per-control shift selection → half-axis identity
+/// suppression → per-control resolve (turbo-gated `on`, then the bind's output/edge). M4 resolves
+/// every `BindTarget` arm; only `Shift`/`Unbound`/`KeyUnbound`/`Unknown` are intentionally silent.
 pub fn apply(
     state: &ControllerState,
     rp: &ResolvedProfile,
     ms: &mut MapState,
     now_us: u64,
 ) -> (OutputState, KbmBatch) {
-    let _ = now_us; // turbo (the only now_us consumer) lands in M4.
     let t = &rp.thresholds;
+
+    // Per-report dt for the mouse accumulator, reconstructed from the monotonic `now_us` (the
+    // signature carries no dt). First call (prev==0) yields dt 0 → only the offset term contributes.
+    let elapsed_s = if ms.prev_now_us == 0 || now_us <= ms.prev_now_us {
+        0.0
+    } else {
+        (now_us - ms.prev_now_us) as f64 * 1e-6
+    };
 
     // --- Step 1: digitize once into a resident bool array (kind-dependent thresholds). -----------
     let mut active_raw = [false; Control::COUNT];
@@ -252,16 +429,21 @@ pub fn apply(
         active_raw[c.as_index()] = state.pressed(c, t);
     }
 
-    // --- Step 2: per-control shift selection is M4; in M3 the effective bind is always the base. --
-    // (We still read `slot.shift_trigger`/`shift_bind` off the resolved slot in M4 additively.)
+    // --- Step 2: per-control shift selection (verifier FIX 4b). ----------------------------------
+    // Each control's effective bind is its shift_bind iff its shift_trigger reads pressed in the RAW
+    // digitized state, else its base bind. Computed once into a dense array, reads RAW only.
+    let mut eff_bind = [BindTarget::Passthrough; Control::COUNT];
+    for c in Control::ALL {
+        eff_bind[c.as_index()] = effective_bind(rp.slot(c), &active_raw);
+    }
 
     // --- Step 3: half-axis identity suppression pass (verifier FIX 1). ---------------------------
-    // For each stick half-axis whose effective bind is not Passthrough, mark its axis so BOTH
+    // For each stick half-axis whose EFFECTIVE bind is not Passthrough, mark its axis so BOTH
     // halves' Passthrough arms suppress the identity (matching ResetToDefaultValue zeroing the pair).
     let mut axis_remapped = [false; 4];
     for c in Control::ALL {
         if let Some(axis) = c.stick_axis() {
-            if rp.slot(c).bind.suppresses_identity() {
+            if eff_bind[c.as_index()].suppresses_identity() {
                 axis_remapped[axis] = true;
             }
         }
@@ -270,15 +452,23 @@ pub fn apply(
     // --- Step 4: per-control resolve. -----------------------------------------------------------
     let mut out = OutputState::default();
     let mut batch = KbmBatch::new();
+    let mcfg = mouse_cfg(rp);
 
     for c in Control::ALL {
         let idx = c.as_index();
         let slot = rp.slot(c);
-        // M3: effective bind is the base bind (shift resolution is M4).
-        let bind = slot.bind;
+        // Effective bind under the per-control shift model (step 2).
+        let bind = eff_bind[idx];
 
-        // M3: turbo gate is M4; the raw active bit is the effective `on`.
-        let on = active_raw[idx];
+        // Previous effective `on` for this control (edge detection), captured before the end-of-loop
+        // write below.
+        let prev_on = ms.prev_active[idx];
+
+        // Turbo: wrap the raw active bit through the slot's turbo gate (phase anchored to press).
+        let on = match slot.turbo {
+            Some(cfg) => turbo_gate(&mut ms.turbo[idx], active_raw[idx], cfg, now_us),
+            None => active_raw[idx],
+        };
 
         match bind {
             BindTarget::Passthrough => {
@@ -289,29 +479,70 @@ pub fn apply(
                     out.buttons.set(b.bit(), true);
                 }
             }
-            BindTarget::Key { vk, kind } => {
-                resolve_key(vk, kind, on, ms.prev_active[idx], ms, &mut batch);
+            BindTarget::GamepadAxis { axis, dir, full } => {
+                resolve_gamepad_axis(&mut out, axis, dir, full, on);
             }
-            // Identity-suppressing no-output binds: emit nothing (the axis pass already zeroed the
-            // pair; button identity is only ever written in the Passthrough arm, so it's suppressed
-            // for free). KeyUnbound == an explicit "no key" (DS4KeyType.Unbound, verifier FIX 5).
-            BindTarget::Unbound | BindTarget::KeyUnbound | BindTarget::Unknown => {}
-
-            // ---- TODO(M4): shift/turbo are read above; these output binds land in M4. ----
-            BindTarget::GamepadAxis { .. } => { /* TODO(M4): digital→axis push */ }
-            BindTarget::Mouse(_) => { /* TODO(M4): mouse-button edge */ }
-            BindTarget::MouseMove(_) => { /* TODO(M4): stick/gyro→mouse via MouseAccumulator */ }
-            BindTarget::MouseWheel(_) => { /* TODO(M4): wheel notch from wheel_remainder */ }
-            BindTarget::Macro(_) => { /* TODO(M4): macro start/stop edge */ }
-            BindTarget::Shift(_) => { /* TODO(M4): shift trigger has no direct output */ }
-            BindTarget::TouchpadClick => { /* TODO(M4): out.buttons.set(TOUCHPAD, on) */ }
-            BindTarget::Special(_) => { /* TODO(M4/M5): control-plane edge */ }
+            BindTarget::TouchpadClick => {
+                if on {
+                    out.buttons.set(crate::output::PadButtons::TOUCHPAD, true);
+                }
+            }
+            BindTarget::Key { vk, kind } => {
+                resolve_key(vk, kind, on, prev_on, ms, &mut batch);
+            }
+            BindTarget::Mouse(btn) => {
+                resolve_mouse_button(btn, on, prev_on, &mut batch);
+            }
+            BindTarget::MouseMove(src) => {
+                // Mouse-move runs continuously while gated on (no edge): the accumulator owns the
+                // sub-pixel carry. Only feed it while `on` so a turbo/shift gate can pulse it.
+                if on {
+                    resolve_mouse_move(src, state, &mcfg, elapsed_s, ms, &mut batch);
+                }
+            }
+            BindTarget::MouseWheel(dir) => {
+                resolve_mouse_wheel(dir, on, prev_on, ms, &mut batch);
+            }
+            BindTarget::Macro(id) => {
+                // Start on the rising edge, stop on the falling edge; timing owned by the injector.
+                if on && !prev_on {
+                    batch.push(KbmEvent::Macro { id, start: true });
+                } else if !on && prev_on {
+                    batch.push(KbmEvent::Macro { id, start: false });
+                }
+            }
+            BindTarget::Special(id) => {
+                // Edge to the control plane (drained off the KBM injector). Fire on the rising edge.
+                if on && !prev_on {
+                    batch.push(KbmEvent::Special { id });
+                }
+            }
+            // No direct output: a `Shift` control only gates other controls (handled in step 2) and
+            // suppresses its own identity. Identity-suppressing no-output binds emit nothing; the
+            // axis pass already zeroed the pair and button identity is only written in the
+            // Passthrough arm. `KeyUnbound` == explicit "no key" (DS4KeyType.Unbound, verifier FIX 5).
+            BindTarget::Shift(_)
+            | BindTarget::Unbound
+            | BindTarget::KeyUnbound
+            | BindTarget::Unknown => {}
         }
 
         ms.prev_active[idx] = on;
     }
 
+    ms.prev_now_us = now_us;
     (out, batch)
+}
+
+/// Resolve a mouse-button binding: emit a `MouseButton{down}` edge on press/release, nothing while
+/// held (ports the DS4Windows mouse-button hold semantics).
+#[inline]
+fn resolve_mouse_button(btn: MouseButton, on: bool, prev_on: bool, batch: &mut KbmBatch) {
+    if on && !prev_on {
+        batch.push(KbmEvent::MouseButton { btn, down: true });
+    } else if !on && prev_on {
+        batch.push(KbmEvent::MouseButton { btn, down: false });
+    }
 }
 
 /// The `Passthrough` arm: copy the physical control through, with half-axis identity suppression.
@@ -323,7 +554,6 @@ fn resolve_passthrough(
     on: bool,
     axis_remapped: &[bool; 4],
 ) {
-    use crate::input::ControlKind;
     match c.kind() {
         ControlKind::AxisDir => {
             if let Some(axis) = c.stick_axis() {
@@ -825,5 +1055,425 @@ mod tests {
         assert_eq!(ms.wheel_remainder, 0.0);
         assert!(!ms.toggle.get(0x41));
         assert!(!ms.pressed_once.get(0x41));
+        assert_eq!(ms.prev_now_us, 0);
+        assert_eq!(ms.stick_mouse.remainder(), (0.0, 0.0));
+        assert_eq!(ms.gyro_mouse.remainder(), (0.0, 0.0));
+    }
+
+    // ----------------------------- M4: shift / turbo / macro / mouse -----------------------------
+    // (AxisDir/GamepadAxis/MouseMoveSrc/TurboCfg/WheelDir/MouseButton come in via `super::*`.)
+
+    use crate::map::binding::ShiftTrigger;
+
+    /// Build a profile with a single slot fully specified (base + shift + turbo).
+    fn rp_slot(c: Control, slot: BindingSlot) -> ResolvedProfile {
+        let mut p = Profile::default();
+        p.bindings.insert(c, slot);
+        p.resolve()
+    }
+
+    #[test]
+    fn per_control_shift_two_distinct_triggers_simultaneously() {
+        // Control X (Cross) is shifted by trigger T1 (L1); control Y (Circle) by T2 (R1). When BOTH
+        // triggers are held, X uses its shift bind AND Y uses its shift bind — distinct, simultaneous
+        // (the faithful per-control model, verifier FIX 4b).
+        let mut p = Profile::default();
+        p.bindings.insert(
+            Control::Cross,
+            BindingSlot {
+                bind: BindTarget::GamepadButton(PadBtn::A),
+                shift_trigger: Some(ShiftTrigger {
+                    control: Control::L1,
+                }),
+                shift_bind: BindTarget::GamepadButton(PadBtn::X),
+                turbo: None,
+            },
+        );
+        p.bindings.insert(
+            Control::Circle,
+            BindingSlot {
+                bind: BindTarget::GamepadButton(PadBtn::B),
+                shift_trigger: Some(ShiftTrigger {
+                    control: Control::R1,
+                }),
+                shift_bind: BindTarget::GamepadButton(PadBtn::Y),
+                turbo: None,
+            },
+        );
+        let rp = p.resolve();
+        let mut ms = MapState::default();
+
+        // No triggers: base binds (A from Cross, B from Circle).
+        let base = ControllerState {
+            cross: true,
+            circle: true,
+            ..Default::default()
+        };
+        let (out, _) = apply(&base, &rp, &mut ms, 0);
+        assert!(out.buttons.has(PadButtons::A) && out.buttons.has(PadButtons::B));
+        assert!(!out.buttons.has(PadButtons::X) && !out.buttons.has(PadButtons::Y));
+
+        // Only T1 (L1) held: Cross shifts to X; Circle stays on its base B.
+        let shifted_x = ControllerState {
+            cross: true,
+            circle: true,
+            l1: true,
+            ..Default::default()
+        };
+        let (out, _) = apply(&shifted_x, &rp, &mut ms, 1);
+        assert!(out.buttons.has(PadButtons::X), "Cross shifted to X");
+        assert!(out.buttons.has(PadButtons::B), "Circle unshifted -> B");
+        assert!(!out.buttons.has(PadButtons::A) && !out.buttons.has(PadButtons::Y));
+
+        // Both triggers held: BOTH controls use their shift binds simultaneously.
+        let both = ControllerState {
+            cross: true,
+            circle: true,
+            l1: true,
+            r1: true,
+            ..Default::default()
+        };
+        let (out, _) = apply(&both, &rp, &mut ms, 2);
+        assert!(
+            out.buttons.has(PadButtons::X) && out.buttons.has(PadButtons::Y),
+            "both controls shifted simultaneously"
+        );
+        assert!(!out.buttons.has(PadButtons::A) && !out.buttons.has(PadButtons::B));
+    }
+
+    #[test]
+    fn analog_shift_trigger_activates_at_trigger_threshold() {
+        // Shift trigger is the analog L2 (trigger kind, 100/255). Below threshold -> base; at/above
+        // -> shift bind. Pins the kind-dependent threshold on the shift trigger read (RAW only).
+        let slot = BindingSlot {
+            bind: BindTarget::GamepadButton(PadBtn::A),
+            shift_trigger: Some(ShiftTrigger {
+                control: Control::L2,
+            }),
+            shift_bind: BindTarget::GamepadButton(PadBtn::B),
+            turbo: None,
+        };
+        let rp = rp_slot(Control::Cross, slot);
+        let mut ms = MapState::default();
+
+        // L2 at 99/255 (below 100/255) -> base A.
+        let lo = ControllerState {
+            cross: true,
+            l2: 99.0 / 255.0,
+            ..Default::default()
+        };
+        let (out, _) = apply(&lo, &rp, &mut ms, 0);
+        assert!(out.buttons.has(PadButtons::A) && !out.buttons.has(PadButtons::B));
+
+        // L2 at 101/255 (above) -> shift bind B.
+        let hi = ControllerState {
+            cross: true,
+            l2: 101.0 / 255.0,
+            ..Default::default()
+        };
+        let (out, _) = apply(&hi, &rp, &mut ms, 1);
+        assert!(out.buttons.has(PadButtons::B) && !out.buttons.has(PadButtons::A));
+    }
+
+    #[test]
+    fn turbo_phase_on_on_off_off_with_press_reset() {
+        // Period 100us, 50% duty -> ON for phase [0,50), OFF for [50,100). Sampling at 0,25,50,75
+        // from a press at t0 gives ON,ON,OFF,OFF. Releasing and re-pressing re-anchors the phase so
+        // a fresh press starts a full ON window.
+        let slot = BindingSlot {
+            bind: BindTarget::GamepadButton(PadBtn::A),
+            shift_trigger: None,
+            shift_bind: BindTarget::Passthrough,
+            turbo: Some(TurboCfg {
+                period_us: 100,
+                duty_num: 1,
+                duty_den: 2,
+            }),
+        };
+        let rp = rp_slot(Control::Cross, slot);
+        let mut ms = MapState::default();
+        let held = ControllerState {
+            cross: true,
+            ..Default::default()
+        };
+
+        // Press at t=1000 (anchor); sample within the cycle.
+        let on_at =
+            |ms: &mut MapState, t: u64| apply(&held, &rp, ms, t).0.buttons.has(PadButtons::A);
+        assert!(on_at(&mut ms, 1000), "phase 0 -> ON");
+        assert!(on_at(&mut ms, 1025), "phase 25 -> ON");
+        assert!(!on_at(&mut ms, 1050), "phase 50 -> OFF");
+        assert!(!on_at(&mut ms, 1075), "phase 75 -> OFF");
+
+        // Release, then re-press much later: the new press re-anchors -> a full ON window again.
+        let released = ControllerState::default();
+        let _ = apply(&released, &rp, &mut ms, 1100);
+        assert!(
+            on_at(&mut ms, 9999),
+            "a fresh press re-anchors the phase to a full ON window"
+        );
+    }
+
+    #[test]
+    fn macro_start_stop_edges() {
+        let rp = rp_with(Control::Square, BindTarget::Macro(7));
+        let mut ms = MapState::default();
+        let down = ControllerState {
+            square: true,
+            ..Default::default()
+        };
+        let up = ControllerState::default();
+
+        // Press -> start edge.
+        let (_, b1) = apply(&down, &rp, &mut ms, 0);
+        assert_eq!(b1.as_slice(), &[KbmEvent::Macro { id: 7, start: true }]);
+        // Hold -> nothing.
+        let (_, b2) = apply(&down, &rp, &mut ms, 1);
+        assert!(b2.is_empty());
+        // Release -> stop edge.
+        let (_, b3) = apply(&up, &rp, &mut ms, 2);
+        assert_eq!(
+            b3.as_slice(),
+            &[KbmEvent::Macro {
+                id: 7,
+                start: false
+            }]
+        );
+    }
+
+    #[test]
+    fn special_fires_on_rising_edge_only() {
+        let rp = rp_with(Control::Options, BindTarget::Special(3));
+        let mut ms = MapState::default();
+        let down = ControllerState {
+            options: true,
+            ..Default::default()
+        };
+        let up = ControllerState::default();
+
+        let (_, b1) = apply(&down, &rp, &mut ms, 0);
+        assert_eq!(b1.as_slice(), &[KbmEvent::Special { id: 3 }]);
+        // Held -> no repeat.
+        let (_, b2) = apply(&down, &rp, &mut ms, 1);
+        assert!(b2.is_empty());
+        // Release -> no edge.
+        let (_, b3) = apply(&up, &rp, &mut ms, 2);
+        assert!(b3.is_empty());
+    }
+
+    #[test]
+    fn mouse_button_edges() {
+        let rp = rp_with(Control::Cross, BindTarget::Mouse(MouseButton::Left));
+        let mut ms = MapState::default();
+        let down = pressed_cross();
+        let up = ControllerState::default();
+
+        let (_, b1) = apply(&down, &rp, &mut ms, 0);
+        assert_eq!(
+            b1.as_slice(),
+            &[KbmEvent::MouseButton {
+                btn: MouseButton::Left,
+                down: true
+            }]
+        );
+        let (_, b2) = apply(&down, &rp, &mut ms, 1);
+        assert!(b2.is_empty(), "no event while held");
+        let (_, b3) = apply(&up, &rp, &mut ms, 2);
+        assert_eq!(
+            b3.as_slice(),
+            &[KbmEvent::MouseButton {
+                btn: MouseButton::Left,
+                down: false
+            }]
+        );
+    }
+
+    #[test]
+    fn mouse_move_from_deflected_stick_with_remainder_carry() {
+        // Right stick bound to mouse-move. A deflected stick over several reports emits MouseMove
+        // events; the sub-pixel remainder carries between reports (no motion is lost). The first
+        // report has dt 0 (prev_now_us == 0) so it only contributes the offset; subsequent reports
+        // have a real dt and produce integer deltas.
+        let rp = rp_with(
+            Control::RxPos,
+            BindTarget::MouseMove(MouseMoveSrc::RightStick),
+        );
+        let mut ms = MapState::default();
+
+        // Full right deflection, sampled at 5ms cadence.
+        let st = ControllerState {
+            rx: 1.0,
+            ..Default::default()
+        };
+        // First report: dt 0 -> with default offset only; may be (0,0). Establish prev_now_us.
+        let _ = apply(&st, &rp, &mut ms, 1_000);
+
+        // Several real-dt reports must eventually emit a non-zero MouseMove with dx > 0 (rightward).
+        let mut saw_move = false;
+        let mut t = 6_000u64;
+        for _ in 0..8 {
+            let (_, b) = apply(&st, &rp, &mut ms, t);
+            for e in b.as_slice() {
+                if let KbmEvent::MouseMove { dx, dy: _ } = e {
+                    assert!(*dx > 0, "right deflection -> rightward mouse, got dx={dx}");
+                    saw_move = true;
+                }
+            }
+            t += 5_000;
+        }
+        assert!(saw_move, "a deflected stick eventually emits a MouseMove");
+    }
+
+    #[test]
+    fn mouse_move_not_emitted_when_gated_off() {
+        // A mouse-move bound behind a shift trigger that is NOT active stays the base Passthrough,
+        // so no MouseMove is emitted from the stick (the base axis passes through instead).
+        let slot = BindingSlot {
+            bind: BindTarget::Passthrough,
+            shift_trigger: Some(ShiftTrigger {
+                control: Control::L1,
+            }),
+            shift_bind: BindTarget::MouseMove(MouseMoveSrc::RightStick),
+            turbo: None,
+        };
+        let rp = rp_slot(Control::RxPos, slot);
+        let mut ms = MapState::default();
+        let st = ControllerState {
+            rx: 1.0,
+            ..Default::default()
+        };
+        let _ = apply(&st, &rp, &mut ms, 1_000);
+        let (out, b) = apply(&st, &rp, &mut ms, 6_000);
+        assert!(
+            b.as_slice()
+                .iter()
+                .all(|e| !matches!(e, KbmEvent::MouseMove { .. })),
+            "no mouse-move while the shift trigger is inactive"
+        );
+        // Base passthrough still reaches the stick axis.
+        assert_eq!(out.rx, 1.0);
+    }
+
+    #[test]
+    fn mouse_wheel_accumulates_to_a_notch() {
+        // A held wheel-up source emits +120 ticks via the 1/3-notch-per-report carry: ~3 reports per
+        // notch. Over 12 reports we expect ~4 notches, all positive vertical, none horizontal, and
+        // the carry never loses motion.
+        let rp = rp_with(Control::DpadUp, BindTarget::MouseWheel(WheelDir::Up));
+        let mut ms = MapState::default();
+        let down = ControllerState {
+            dpad_up: true,
+            ..Default::default()
+        };
+
+        let mut ticks = 0i32;
+        for t in 0..12u64 {
+            let (_, b) = apply(&down, &rp, &mut ms, t);
+            for e in b.as_slice() {
+                if let KbmEvent::Wheel {
+                    vertical,
+                    horizontal,
+                } = e
+                {
+                    assert_eq!(*horizontal, 0);
+                    assert!(*vertical > 0, "wheel up -> positive vertical");
+                    ticks += vertical / 120;
+                }
+            }
+        }
+        assert!(
+            (3..=4).contains(&ticks),
+            "12 reports at 1/3-notch each -> ~4 notches, got {ticks}"
+        );
+
+        // Release resets the remainder so a later press starts fresh.
+        let (_, _) = apply(&ControllerState::default(), &rp, &mut ms, 12);
+        assert_eq!(ms.wheel_remainder, 0.0);
+    }
+
+    #[test]
+    fn gamepad_axis_digital_push() {
+        // Cross -> push the right stick fully to +X.
+        let rp = rp_with(
+            Control::Cross,
+            BindTarget::GamepadAxis {
+                axis: GamepadAxis::Rx,
+                dir: AxisDir::Pos,
+                full: true,
+            },
+        );
+        let mut ms = MapState::default();
+        let (out, _) = apply(&pressed_cross(), &rp, &mut ms, 0);
+        assert_eq!(out.rx, 1.0);
+        // Released -> neutral.
+        let (out0, _) = apply(&ControllerState::default(), &rp, &mut ms, 1);
+        assert_eq!(out0.rx, 0.0);
+    }
+
+    #[test]
+    fn touchpad_click_output_bit() {
+        let rp = rp_with(Control::Cross, BindTarget::TouchpadClick);
+        let mut ms = MapState::default();
+        let (out, _) = apply(&pressed_cross(), &rp, &mut ms, 0);
+        assert!(out.buttons.has(PadButtons::TOUCHPAD));
+    }
+
+    #[test]
+    fn turbo_gate_unit_phase() {
+        // Direct gate test: period 100, 25% duty -> ON for [0,25), OFF for [25,100).
+        let cfg = TurboCfg {
+            period_us: 100,
+            duty_num: 1,
+            duty_den: 4,
+        };
+        let mut ts = TurboState::default();
+        assert!(turbo_gate(&mut ts, true, cfg, 1000), "phase 0 -> ON");
+        assert!(turbo_gate(&mut ts, true, cfg, 1024), "phase 24 -> ON");
+        assert!(!turbo_gate(&mut ts, true, cfg, 1025), "phase 25 -> OFF");
+        assert!(!turbo_gate(&mut ts, true, cfg, 1099), "phase 99 -> OFF");
+        assert!(
+            turbo_gate(&mut ts, true, cfg, 1100),
+            "phase 0 (next cycle) -> ON"
+        );
+        // Release clears the active flag (re-anchors on next press).
+        assert!(!turbo_gate(&mut ts, false, cfg, 1200));
+        assert!(!ts.was_active);
+    }
+
+    #[test]
+    fn shifted_half_axis_suppresses_identity_pair() {
+        // LxPos's shift bind (active under L1) is a key, so while L1 is held BOTH halves of Lx go
+        // neutral (the axis_remapped pass uses the EFFECTIVE bind). Without L1, the base is
+        // Passthrough and the axis flows.
+        let slot = BindingSlot {
+            bind: BindTarget::Passthrough,
+            shift_trigger: Some(ShiftTrigger {
+                control: Control::L1,
+            }),
+            shift_bind: BindTarget::Key {
+                vk: 0x41,
+                kind: KeyKind::HOLD,
+            },
+            turbo: None,
+        };
+        let rp = rp_slot(Control::LxPos, slot);
+        let mut ms = MapState::default();
+
+        // No shift: the negative half passes through.
+        let left = ControllerState {
+            lx: -0.8,
+            ..Default::default()
+        };
+        let (out, _) = apply(&left, &rp, &mut ms, 0);
+        assert_eq!(out.lx, -0.8, "unshifted axis passes through");
+
+        // Shift active (L1): the effective bind for LxPos is a key -> the WHOLE Lx axis is zeroed.
+        let left_shift = ControllerState {
+            lx: -0.8,
+            l1: true,
+            ..Default::default()
+        };
+        let (out, _) = apply(&left_shift, &rp, &mut ms, 1);
+        assert_eq!(out.lx, 0.0, "shifted half remaps -> both halves neutral");
     }
 }

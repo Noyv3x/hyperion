@@ -17,12 +17,12 @@
 //! [`hyperion_core::map::BindingSlot`] / thread / hidhide) and sends the corresponding
 //! `ControlMsg`; the engine is the sole writer that validates, clamps, and republishes.
 //!
-//! M3 scope (`DESIGN-REMAP.md` §12): this is the **minimal coherent** remap surface — the existing
-//! RC panel now edits the active profile's `ls`/`rs` RC sub-config, a stick-settings panel exposes
-//! deadzone / sensitivity / curve, and a single binding row lets the user pick a `Control` and bind
-//! it to a `GamepadButton` or a captured `Key`. The full editor (per-control diagram, macros, gyro,
-//! profile manager) is fleshed out across M3/M4 in the screens named in §8; everything routes
-//! through `ControlMsg` (single writer) and never touches the hot loop.
+//! M4 scope (`DESIGN-REMAP.md` §12): the remap surface now spans **Mapping** (bind any control to
+//! any `BindTarget` + an optional shift trigger + turbo), **Sticks** (RC + deadzone / sensitivity /
+//! curve), **Mouse** (mouse-from-stick sensitivity / deadzone / accel / invert), **Macros** (timed
+//! step-list editor), and **Engine** (thread / HidHide). The Triggers / gyro / profile-manager
+//! screens land in later milestones; everything routes through `ControlMsg` (single writer) and
+//! never touches the hot loop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,9 +34,12 @@ use engine::handoff::TelemetryRx;
 use engine::telemetry::TelemetryFrame;
 use engine::{ControlMsg, Stick};
 use hyperion_core::config::{HidHideConfig, ThreadConfig};
+use hyperion_core::map::{MacroDef, MouseSettings};
 use hyperion_core::stick::settings::StickSettings;
 
 mod bindings;
+mod macros;
+mod mouse;
 mod panels;
 mod scope;
 mod sticks;
@@ -66,28 +69,40 @@ const REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 /// How many recent output points to keep per stick for the scope trail.
 const TRAIL_LEN: usize = 48;
 
-/// The top-level tabs (`DESIGN-REMAP.md` §8). M3 ships **Mapping**, **Sticks**, and **Engine**;
-/// the Triggers / Mouse-Gyro / Macros / Profiles screens land additively in later milestones, so
-/// they are intentionally absent from this enum rather than stubbed as empty panels.
+/// The top-level tabs (`DESIGN-REMAP.md` §8). M4 ships **Mapping**, **Sticks**, **Mouse**,
+/// **Macros**, and **Engine**; the Triggers / Gyro / Profiles screens land additively in later
+/// milestones, so they are intentionally absent from this enum rather than stubbed as empty panels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
-    /// Per-control binding editor (the basic `Control → Binding` remap row).
+    /// Per-control binding editor: bind any control to any [`BindTarget`] + shift + turbo.
     Mapping,
     /// Per-stick settings: RC sub-section + deadzone / sensitivity / curve.
     Sticks,
+    /// Mouse-from-stick settings (sensitivity / deadzone / accel / invert).
+    Mouse,
+    /// Macro editor (add/edit/delete timed macro step lists).
+    Macros,
     /// Global engine policy: thread / scheduling + HidHide.
     Engine,
 }
 
 impl Tab {
     /// The tab strip, in display order.
-    const ALL: [Tab; 3] = [Tab::Mapping, Tab::Sticks, Tab::Engine];
+    const ALL: [Tab; 5] = [
+        Tab::Mapping,
+        Tab::Sticks,
+        Tab::Mouse,
+        Tab::Macros,
+        Tab::Engine,
+    ];
 
     /// Display label.
     fn label(self) -> &'static str {
         match self {
             Tab::Mapping => "Mapping",
             Tab::Sticks => "Sticks",
+            Tab::Mouse => "Mouse",
+            Tab::Macros => "Macros",
             Tab::Engine => "Engine",
         }
     }
@@ -114,7 +129,8 @@ pub struct HyperionApp {
     hidhide: HidHideConfig,
     /// The currently selected top-level tab.
     tab: Tab,
-    /// Transient binding-editor state (the M3 `Control → Binding` row); never persisted.
+    /// Transient binding-editor state (the per-control `Control → BindTarget` + shift + turbo
+    /// composer); never persisted.
     binding_editor: bindings::BindingEditor,
     /// The system-tray handle + menu ids; built once the eframe/winit loop is live (see
     /// [`HyperionApp::with_tray`]). `None` if tray creation failed (the GUI still works).
@@ -134,6 +150,10 @@ pub struct ProfileMirror {
     pub ls: StickSettings,
     /// Right-stick settings.
     pub rs: StickSettings,
+    /// Mouse-from-stick settings (M4 Mouse tab).
+    pub mouse: MouseSettings,
+    /// The profile's macro definitions (M4 Macros tab).
+    pub macros: Vec<MacroDef>,
 }
 
 impl ProfileMirror {
@@ -225,6 +245,8 @@ impl ProfileMirror {
             profile: profile_id,
             ls: profile.ls,
             rs: profile.rs,
+            mouse: profile.mouse,
+            macros: profile.macros,
         }
     }
 }
@@ -314,6 +336,8 @@ impl eframe::App for HyperionApp {
                     ui.separator();
                     sticks::stick_panel(ui, self, Stick::Right);
                 }
+                Tab::Mouse => mouse::mouse_panel(ui, self),
+                Tab::Macros => macros::macros_panel(ui, self),
                 Tab::Engine => panels::global_panel(ui, self),
             });
         });
@@ -354,6 +378,61 @@ impl HyperionApp {
             profile: self.mirror.profile.clone(),
             control,
             bind,
+        });
+    }
+
+    /// Set (or clear, with `trigger == None`) the per-control shift trigger + shift bind on the
+    /// active profile (`SetShiftTrigger`, blueprint §5 step 2 / §9).
+    pub(crate) fn push_shift_trigger(
+        &mut self,
+        control: hyperion_core::input::Control,
+        trigger: Option<hyperion_core::map::ShiftTrigger>,
+        bind: hyperion_core::map::BindTarget,
+    ) {
+        self.send(ControlMsg::SetShiftTrigger {
+            profile: self.mirror.profile.clone(),
+            control,
+            trigger,
+            bind,
+        });
+    }
+
+    /// Set (or clear, with `turbo == None`) the per-binding turbo config on the active profile
+    /// (`SetBindingTurbo`, blueprint §5 / §9).
+    pub(crate) fn push_binding_turbo(
+        &mut self,
+        control: hyperion_core::input::Control,
+        turbo: Option<hyperion_core::map::TurboCfg>,
+    ) {
+        self.send(ControlMsg::SetBindingTurbo {
+            profile: self.mirror.profile.clone(),
+            control,
+            turbo,
+        });
+    }
+
+    /// Re-send the active profile's whole [`MouseSettings`] (after any Mouse-tab widget edit). The
+    /// engine clamps on apply; the mirror keeps the user's typed value.
+    pub(crate) fn push_mouse_settings(&mut self) {
+        self.send(ControlMsg::SetMouseSettings {
+            profile: self.mirror.profile.clone(),
+            settings: self.mirror.mouse,
+        });
+    }
+
+    /// Insert or replace a macro definition on the active profile (`UpsertMacro`).
+    pub(crate) fn upsert_macro(&mut self, def: MacroDef) {
+        self.send(ControlMsg::UpsertMacro {
+            profile: self.mirror.profile.clone(),
+            def,
+        });
+    }
+
+    /// Delete a macro by id from the active profile (`DeleteMacro`).
+    pub(crate) fn delete_macro(&mut self, id: u16) {
+        self.send(ControlMsg::DeleteMacro {
+            profile: self.mirror.profile.clone(),
+            id,
         });
     }
 

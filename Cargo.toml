@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/hid-input",
+    "crates/vgamepad-output",
+    "crates/platform-win",
+    "crates/engine",
+    "crates/app",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.0"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Noyv3x/hyperion"
+authors = ["Vexon <noyvex@icloud.com>"]
+
+[workspace.dependencies]
+# pure-core deps
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# core dev-deps
+approx = "0.5"
+proptest = "1"
+# engine hot-path / handoff deps (no Mutex on the hot loop)
+arc-swap = "1"
+rtrb = "0.3"
+triple_buffer = "8"
+crossbeam-channel = "0.5"
+
+[workspace.lints.clippy]
+all = "warn"
+
+# Thin release profile tuned for the latency-sensitive runtime.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

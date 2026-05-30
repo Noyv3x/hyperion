@@ -1,0 +1,22 @@
+[package]
+name = "hyperion-core"
+description = "Pure, OS-free numeric core for the Hyperion controller engine: stick algorithms (RC filter), precision conversion, dt time-base, input parsing, output mapping, config."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "hyperion_core"
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "platform-win"
+description = "Windows-only platform helpers for Hyperion: HidHide IOCTL/CLI, timer-resolution RAII, MMCSS, core affinity, and process priority class."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+hyperion-core = { path = "../core" }
+
+[lints]
+workspace = true

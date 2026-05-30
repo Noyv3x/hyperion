@@ -1,0 +1,14 @@
+[package]
+name = "vgamepad-output"
+description = "Windows-only virtual gamepad output for Hyperion: maps the core OutputFrame to an XUSB report and submits it to a ViGEm Xbox 360 target via one synchronous IOCTL."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+hyperion-core = { path = "../core" }
+
+[lints]
+workspace = true

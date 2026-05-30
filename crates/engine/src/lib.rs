@@ -17,9 +17,19 @@
 
 pub mod clock;
 pub mod config_store;
+pub mod control;
+pub mod error;
 pub mod handoff;
+pub mod runtime;
 pub mod seq;
 pub mod telemetry;
+
+#[doc(inline)]
+pub use control::{ControlMsg, Stick};
+#[doc(inline)]
+pub use error::EngineError;
+#[doc(inline)]
+pub use runtime::Runtime;
 
 /// Re-export of the pure [`hyperion_core`] config tree so binaries that depend only on
 /// `engine` (e.g. the headless `app`) can build / load an [`EngineConfig`] without taking a
@@ -38,11 +48,11 @@ mod win_io;
 
 /// Assemble the supervisor + hot thread and run until shutdown (Windows only).
 ///
-/// M1 is a headless vertical slice: no egui yet (that lands in M2). This entry point owns
-/// the timer-resolution / HidHide / ViGEm lifecycle through [`supervisor`], spawns the hot
-/// thread, and blocks until it joins. The body is an M1 skeleton — the control flow and
-/// types are real, the device/driver I/O is filled in during hardware bring-up.
+/// A thin headless entry point that owns the timer-resolution / HidHide / ViGEm lifecycle
+/// through [`supervisor`], spawns the hot thread, and blocks until it joins. The GUI binary
+/// (M2) uses [`Runtime`] instead, which returns immediately so egui can own the main thread;
+/// this `run()` is kept for headless use and as the simplest possible integration smoke test.
 #[cfg(windows)]
-pub fn run() -> Result<(), supervisor::EngineError> {
+pub fn run() -> Result<(), EngineError> {
     supervisor::Supervisor::new()?.run()
 }

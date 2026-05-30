@@ -33,8 +33,10 @@ platform-win   [win] #![cfg(windows)]     HidHide (IOCTL + CLI fallback), timer-
 engine               core (always) +      Thread architecture + lock-free handoff. Owns the hot loop,
                      [win] the 3 above     dt measurement, telemetry, config store, supervisor.
                                           Pure parts (clock, seq, handoff, config_store) are Linux-testable.
-app          [win]   bin "hyperion"       Wires the supervisor, spawns the hot thread, runs the
-                                          egui + tray event loop.
+app          [win]   bin "hyperion"       Starts the non-blocking engine Runtime, then runs the
+                                          LIVE egui tuning GUI + tray on the main thread (M2). The
+                                          GUI only reads the telemetry triple-buffer and sends
+                                          ControlMsg edits to the single config writer.
 ```
 
 Dependency direction: `core` depends on nothing OS. `engine` depends on `core`
@@ -71,6 +73,33 @@ round-trip); the Windows I/O crates are compiling skeletons being filled in.
 There are **no `windows` / ViGEm / egui dependencies in M1** — the platform crates
 are dependency-free `cfg(windows)` skeletons so the workspace builds cleanly while
 the slice comes together.
+
+## M2 status
+
+M2 adds the **live egui tuning GUI** (Windows). `app` now starts the non-blocking
+[`engine::Runtime`], hands the GUI a telemetry reader + a `ControlMsg` sender + a seed
+config snapshot, and runs eframe on the main thread; on exit it calls `Runtime::shutdown`
+(which joins the hot loop, restoring timer resolution, then the config-writer thread).
+
+The GUI is strictly **off the hot path** (`DESIGN.md` §6/§10): it only *reads* the
+triple-buffered telemetry frame and *sends* `engine::ControlMsg` edits to the engine's
+single config-writer thread — it never locks anything the hot loop touches and never
+writes the config `ArcSwap` directly. It offers:
+
+- per-stick (LS / RS) panels: mode (None / RC), RC algorithm
+  (FireBird integer / Ultimate legacy / Ultimate dt), fixed-vs-dynamic param, `period_us`
+  and `fixed_param` sliders, and a 4-point **dynamic-curve editor** with a live preview;
+- a global **thread / scheduling** + **HidHide** policy panel, and **Save** / **Reload**
+  buttons (`SaveToDisk` / `ReloadFromDisk`);
+- a live **stick scope** (input dot vs. filtered-output dot + a short trail) so you *see*
+  the RC filter's effect while tuning, plus `dt`, `loop busy`, `dropped`, `duplicates`,
+  and rate readouts;
+- a **system tray** (Show / Hide / Quit) integrated into the shared eframe/winit loop.
+
+The eframe/egui/tray-icon dependencies are gated under
+`[target.'cfg(windows)'.dependencies]` so the Linux core CI job (which never builds `app`)
+and a local Linux `cargo check --workspace` stay **gtk-free**; the GUI code is
+`#[cfg(windows)]` and type-checked for `x86_64-pc-windows-msvc`.
 
 ## High-poll XInput controller (input needed)
 

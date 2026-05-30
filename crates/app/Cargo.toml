@@ -1,6 +1,6 @@
 [package]
 name = "app"
-description = "Hyperion application binary: wires the supervisor, spawns the hot thread, and runs the egui + tray event loop."
+description = "Hyperion application binary: starts the non-blocking engine Runtime and runs the live egui tuning GUI + tray on the main thread."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -14,10 +14,23 @@ path = "src/main.rs"
 [dependencies]
 engine = { path = "../engine" }
 
-# Ctrl-C handling is only wired on the Windows headless runtime; the non-Windows build is a
-# pure compile check and never touches it, so keep the dep off that target.
+# The live egui tuning GUI + tray are Windows-only (the engine runtime is Windows-only), and
+# eframe/egui pull winit, which would need gtk on Linux. Gating these under the Windows target
+# keeps `cargo check --workspace` on Linux gtk-free while still type-checking the GUI for the
+# `x86_64-pc-windows-msvc` target. Ctrl-C handling lives here too (Windows-only runtime).
 [target.'cfg(windows)'.dependencies]
 ctrlc = "3"
+# eframe re-exports egui as `eframe::egui`; we drive `run_native` and own the winit main thread.
+eframe = "0.33"
+# System-tray icon + context menu, integrated into the shared winit/eframe event loop.
+tray-icon = "0.19"
+# Name the `engine::Runtime::control_sender()` channel type the GUI sends `ControlMsg`s on.
+crossbeam-channel = { workspace = true }
+# The GUI builds `hyperion_core::rc::{RcConfig, RcMode, RcCurve}` + the param/period range
+# constants directly to assemble `ControlMsg::SetRc`. `engine` re-exports the config tree but
+# not `rc`, so depend on core directly (it is pure and cross-platform). Windows-only: only the
+# GUI consumes it, so Linux `app` stays minimal.
+hyperion-core = { path = "../core" }
 
 [lints]
 workspace = true

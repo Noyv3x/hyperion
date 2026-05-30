@@ -716,13 +716,16 @@ mod tests {
         };
         let (frame, kbm) = step(&mut res, &input);
         assert!(kbm.is_none(), "fast path emits no KBM batch");
-        // With default (passthrough) sticks, the filtered sticks equal the input sticks.
-        assert_eq!(frame.lx, 0.25);
-        assert_eq!(frame.ly, -0.5);
-        assert_eq!(frame.rx, -0.1);
-        assert_eq!(frame.ry, 0.9);
-        assert_eq!(frame.lt, 0.4);
-        assert_eq!(frame.rt, 0.6);
+        // With default (passthrough) sticks, the filtered sticks equal the input sticks — to
+        // within the ~1e-15 float round-trip of entering/exiting the DS4 [0,255] domain once
+        // (values like 0.25 that are exact n/128 round-trip bit-exact; -0.1/0.9 carry epsilon).
+        let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-9, "{a} vs {b}");
+        near(frame.lx, 0.25);
+        near(frame.ly, -0.5);
+        near(frame.rx, -0.1);
+        near(frame.ry, 0.9);
+        near(frame.lt, 0.4);
+        near(frame.rt, 0.6);
         // Buttons survive the lower→pack round-trip identically.
         assert_eq!(frame.buttons, XI_A | XI_DPAD_UP);
     }

@@ -109,6 +109,22 @@ fn jitter_ease(motion: f64, norm: f64) -> f64 {
     }
 }
 
+/// The touchpad jitter-compensation ease (`MouseCursor.cs:404-417`): where `|motion| ≤ norm·0.15`,
+/// reshape it as `sign·(|motion|/0.15)^1.408·0.15` so micro-slides are suppressed without a hard
+/// dead-zone; larger motions pass through unchanged. Same `^1.408` curve as the gyro path, but the
+/// touch path uses the `0.15` threshold (`TOUCH_JITTER_THRESHOLD`), not the gyro `0.26`.
+#[inline]
+fn touch_jitter_ease(motion: f64, norm: f64) -> f64 {
+    let abs = motion.abs();
+    if abs <= norm * TOUCH_JITTER_THRESHOLD {
+        signum_strict(motion)
+            * (abs / TOUCH_JITTER_THRESHOLD).powf(GYRO_JITTER_POWER)
+            * TOUCH_JITTER_THRESHOLD
+    } else {
+        motion
+    }
+}
+
 /// Tunable mouse-from-stick / gyro settings the accumulator consumes (the resolved, hot-facing
 /// form). All `Copy`; derived from the profile's `MouseSettings` off the hot path.
 ///
@@ -215,6 +231,65 @@ impl Default for GyroAccumCfg {
             vertical_scale: 1.0,
             velocity_offset: GYRO_MOUSE_OFFSET_DEFAULT,
             deadzone: GYRO_MOUSE_DEADZONE_DEFAULT,
+            min_threshold: 1.0,
+            jitter_comp: true,
+            invert_x: false,
+            invert_y: false,
+        }
+    }
+}
+
+// ----------------------------------- touchpad→mouse (M6) constants ------------------------------
+//
+// Ground truth: `Hyperion-ds4w/.../MouseCursor.cs::TouchMoveCursor` (lines 377-466). The touchpad
+// relative-mouse path takes the per-report delta between successive finger contacts (raw HwX/HwY
+// grid units), scales by a coefficient, adds a small direction-split anti-jitter offset, optionally
+// eases micro-jitter with the same `^1.408` curve as the gyro path, then runs the shared
+// remainder-carry / min-threshold gate (`finalize_core`).
+
+/// DS4Windows `TOUCHPAD_MOUSE_OFFSET` (`MouseCursor.cs:62`): the direction-split anti-jitter start
+/// offset added past zero so a tiny touch slide still nudges the cursor.
+pub const TOUCH_MOUSE_OFFSET_DEFAULT: f64 = 0.015;
+
+/// DS4Windows touch jitter-comp threshold (`MouseCursor.cs:407`, `0.15`): below `norm·0.15` the
+/// motion is eased with the shared `^1.408` curve (`GYRO_JITTER_POWER`).
+pub const TOUCH_JITTER_THRESHOLD: f64 = 0.15;
+
+/// Tunable touchpad→mouse settings the accumulator consumes (the resolved, hot-facing form). All
+/// `Copy`; derived from the profile's `TouchpadSettings`
+/// ([`TouchpadSettings::to_accum_cfg`](crate::map::profile::TouchpadSettings::to_accum_cfg)) off the
+/// hot path.
+///
+/// Field semantics mirror DS4Windows `TouchpadRelMouseSettings` / `getTouchSensitivity`:
+/// * `sensitivity` — `getTouchSensitivity·0.01` (the `coefficient`); `1.0` ≈ the C#
+///   `touchSensitivity == 100` default.
+/// * `velocity_offset` — `TOUCHPAD_MOUSE_OFFSET`, the direction-split anti-jitter start offset.
+/// * `min_threshold` — the per-report motion gate (`1.0` == the always-carry special case).
+/// * `jitter_comp` — enable the `^1.408` ease below [`TOUCH_JITTER_THRESHOLD`].
+/// * `invert_x` / `invert_y` — negate the final delta per axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TouchAccumCfg {
+    /// Master touch→mouse coefficient (`getTouchSensitivity·0.01`).
+    pub sensitivity: f64,
+    /// Direction-split anti-jitter offset (`TOUCHPAD_MOUSE_OFFSET`).
+    pub velocity_offset: f64,
+    /// Per-report motion gate (`1.0` == always-carry special case).
+    pub min_threshold: f64,
+    /// Apply the `^1.408` jitter-compensation ease curve below the threshold.
+    pub jitter_comp: bool,
+    /// Invert the horizontal (X) output.
+    pub invert_x: bool,
+    /// Invert the vertical (Y) output.
+    pub invert_y: bool,
+}
+
+impl Default for TouchAccumCfg {
+    /// DS4Windows-class touch defaults: unity coefficient, the default anti-jitter offset, the
+    /// always-carry gate, jitter compensation on, no inversion.
+    fn default() -> Self {
+        Self {
+            sensitivity: 1.0,
+            velocity_offset: TOUCH_MOUSE_OFFSET_DEFAULT,
             min_threshold: 1.0,
             jitter_comp: true,
             invert_x: false,
@@ -415,6 +490,73 @@ impl MouseAccumulator {
         if cfg.jitter_comp {
             motion_x = jitter_ease(motion_x, norm_x);
             motion_y = jitter_ease(motion_y, norm_y);
+        }
+
+        self.finalize_core(
+            motion_x,
+            motion_y,
+            cfg.min_threshold,
+            cfg.invert_x,
+            cfg.invert_y,
+        )
+    }
+
+    /// **M6 touchpad→mouse**: step the accumulator from the delta between two successive finger
+    /// contacts and return the integer `(dx, dy)`, porting DS4Windows `MouseCursor.TouchMoveCursor`.
+    ///
+    /// `prev`/`cur` are the same finger's [`TouchContact`] on the previous and current report. The
+    /// delta is taken in raw touch-grid units (`cur.x − prev.x`, `cur.y − prev.y`); `+dx` is right
+    /// and `+dy` is down on screen (the touchpad Y already increases downward, matching the OS, so
+    /// no inversion — unlike the stick path). The motion is emitted ONLY when the SAME finger is
+    /// active on both reports (`prev.is_active && cur.is_active && prev.id == cur.id`); a finger
+    /// lift / new contact / id change yields `(0, 0)` and resets the carry (C# `lastTouchID` guard).
+    ///
+    /// Ported semantics (`MouseCursor.cs:377-466`):
+    /// 1. `coefficient = sensitivity`; `xMotion = coefficient·dx + normX·(offset·signX)`.
+    /// 2. Direction split `atan2(-dy, dx)` → `(|cos|, |sin|)` for the per-axis offset.
+    /// 3. Optional jitter comp: where `|motion| ≤ norm·0.15`, ease via `sign·(|motion|/0.15)^1.408·0.15`.
+    /// 4. Shared remainder-carry + `min_threshold` gate + per-axis invert ([`finalize_core`]).
+    pub fn touch_step(
+        &mut self,
+        prev: crate::input::TouchContact,
+        cur: crate::input::TouchContact,
+        cfg: &TouchAccumCfg,
+    ) -> (i32, i32) {
+        // Only a continuous same-finger drag moves the cursor; a lift / new contact / id change
+        // breaks the delta and resets the carry (no spurious jump on touch-down).
+        if !(prev.is_active && cur.is_active && prev.id == cur.id) {
+            self.reset();
+            return (0, 0);
+        }
+        let dx = f64::from(cur.x) - f64::from(prev.x);
+        let dy = f64::from(cur.y) - f64::from(prev.y);
+        if dx == 0.0 && dy == 0.0 {
+            return (0, 0);
+        }
+
+        // Direction split (atan2 unit vector), matching `Math.Atan2(-dy, dx)`.
+        let angle = (-dy).atan2(dx);
+        let norm_x = angle.cos().abs();
+        let norm_y = angle.sin().abs();
+        let sign_x = signum_strict(dx);
+        let sign_y = signum_strict(dy);
+
+        let coefficient = cfg.sensitivity;
+        let offset = cfg.velocity_offset;
+        let mut motion_x = if dx != 0.0 {
+            coefficient * dx + norm_x * (offset * sign_x)
+        } else {
+            0.0
+        };
+        let mut motion_y = if dy != 0.0 {
+            coefficient * dy + norm_y * (offset * sign_y)
+        } else {
+            0.0
+        };
+
+        if cfg.jitter_comp {
+            motion_x = touch_jitter_ease(motion_x, norm_x);
+            motion_y = touch_jitter_ease(motion_y, norm_y);
         }
 
         self.finalize_core(
@@ -947,5 +1089,135 @@ mod tests {
         assert_eq!(signum_strict(-0.0), 0.0);
         assert_eq!(signum_strict(3.0), 1.0);
         assert_eq!(signum_strict(-3.0), -1.0);
+    }
+
+    // ------------------------------------ M6 touchpad→mouse --------------------------------------
+
+    use crate::input::TouchContact;
+
+    fn contact(id: u8, x: u16, y: u16) -> TouchContact {
+        TouchContact {
+            is_active: true,
+            id,
+            x,
+            y,
+        }
+    }
+
+    fn touch_clean() -> TouchAccumCfg {
+        TouchAccumCfg {
+            sensitivity: 1.0,
+            velocity_offset: 0.0,
+            min_threshold: 1.0,
+            jitter_comp: false,
+            invert_x: false,
+            invert_y: false,
+        }
+    }
+
+    #[test]
+    fn touch_default_cfg_matches_constants() {
+        let d = TouchAccumCfg::default();
+        assert_eq!(d.velocity_offset, TOUCH_MOUSE_OFFSET_DEFAULT);
+        assert_eq!(d.min_threshold, 1.0);
+        assert!(d.jitter_comp);
+    }
+
+    #[test]
+    fn touch_drag_right_and_down() {
+        // Same finger slides +20 x, +10 y -> dx>0 (right), dy>0 (down on screen).
+        let cfg = touch_clean();
+        let mut acc = MouseAccumulator::new();
+        let (dx, dy) = acc.touch_step(contact(1, 100, 100), contact(1, 120, 110), &cfg);
+        assert!(dx > 0, "slide right -> dx>0, got {dx}");
+        assert!(dy > 0, "slide down -> dy>0, got {dy}");
+    }
+
+    #[test]
+    fn touch_new_contact_yields_no_motion_and_resets() {
+        let cfg = touch_clean();
+        let mut acc = MouseAccumulator::new();
+        // Build a carry, then a finger lift (cur inactive) -> reset, no motion.
+        let _ = acc.touch_step(contact(1, 100, 100), contact(1, 100, 100), &cfg);
+        let lift = TouchContact::default();
+        let (dx, dy) = acc.touch_step(contact(1, 100, 100), lift, &cfg);
+        assert_eq!((dx, dy), (0, 0), "finger lift -> no motion");
+        assert_eq!(acc.remainder(), (0.0, 0.0), "carry reset on lift");
+        // A new contact (different id) also breaks the delta -> no jump.
+        let (dx2, dy2) = acc.touch_step(contact(1, 100, 100), contact(2, 900, 900), &cfg);
+        assert_eq!((dx2, dy2), (0, 0), "id change -> no spurious jump");
+    }
+
+    #[test]
+    fn touch_zero_delta_no_motion() {
+        let cfg = touch_clean();
+        let mut acc = MouseAccumulator::new();
+        let (dx, dy) = acc.touch_step(contact(1, 500, 500), contact(1, 500, 500), &cfg);
+        assert_eq!((dx, dy), (0, 0));
+    }
+
+    #[test]
+    fn touch_remainder_carry_accumulates() {
+        // sensitivity 0.04 with a dx of 10 -> 0.4 px per report; three reports -> 0,0,1 (rem 0.2).
+        let cfg = TouchAccumCfg {
+            sensitivity: 0.04,
+            ..touch_clean()
+        };
+        let mut acc = MouseAccumulator::new();
+        let step = |acc: &mut MouseAccumulator, from: u16, to: u16| {
+            acc.touch_step(contact(1, from, 0), contact(1, to, 0), &cfg)
+                .0
+        };
+        // Move +10 each report; the absolute x climbs so the per-report delta stays 10.
+        let a = step(&mut acc, 0, 10);
+        let b = step(&mut acc, 10, 20);
+        let c = step(&mut acc, 20, 30);
+        assert_eq!((a, b, c), (0, 0, 1), "touch 0.4×3 -> 0,0,1 carry");
+        let (h, _) = acc.remainder();
+        assert!((h - 0.2).abs() < 1e-9, "carry remainder ≈ 0.2, got {h}");
+    }
+
+    #[test]
+    fn touch_invert_flags_negate_output() {
+        let base = TouchAccumCfg {
+            sensitivity: 1.0,
+            ..touch_clean()
+        };
+        let mut a = MouseAccumulator::new();
+        let (dx, dy) = a.touch_step(contact(1, 100, 100), contact(1, 130, 130), &base);
+        assert!(dx > 0 && dy > 0);
+        let inv = TouchAccumCfg {
+            invert_x: true,
+            invert_y: true,
+            ..base
+        };
+        let mut b = MouseAccumulator::new();
+        let (idx, idy) = b.touch_step(contact(1, 100, 100), contact(1, 130, 130), &inv);
+        assert_eq!((idx, idy), (-dx, -dy), "touch invert negates both axes");
+    }
+
+    #[test]
+    fn touch_jitter_comp_eases_small_slide() {
+        // A 1-unit slide with a small coefficient lands in the jitter region; comp eases it smaller.
+        let off = TouchAccumCfg {
+            sensitivity: 0.1,
+            jitter_comp: false,
+            ..touch_clean()
+        };
+        let on = TouchAccumCfg {
+            jitter_comp: true,
+            ..off
+        };
+        let mut a = MouseAccumulator::new();
+        let _ = a.touch_step(contact(1, 0, 0), contact(1, 1, 0), &off);
+        let (ho, _) = a.remainder();
+        let mut b = MouseAccumulator::new();
+        let _ = b.touch_step(contact(1, 0, 0), contact(1, 1, 0), &on);
+        let (hj, _) = b.remainder();
+        assert!(ho > 0.0 && hj > 0.0, "both carry a positive remainder");
+        assert!(
+            hj < ho,
+            "jitter comp eases the small slide smaller: {ho} -> {hj}"
+        );
     }
 }

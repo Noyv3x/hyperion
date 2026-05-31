@@ -179,6 +179,20 @@ impl DeviceSource for DualSenseDevice {
 /// (`raw_buttons = s.buttons.0`, blueprint §9) so the mapping engine's `ControllerState` decode
 /// reads the structured buttons with zero new device-side decode. `dt_us` / `dropped` /
 /// `is_duplicate` / `host_qpc_ns` carry through (the backend already folded them).
+///
+/// **M6 touch / Edge (MAINTAINER NOTE).** [`HotInput`] now carries the two decoded touchpad finger
+/// contacts (`touch`) and the Edge button superset (`edge`); `core` decodes both in
+/// [`decode_controller_state`](hyperion_core::input::ds_report::decode_controller_state) /
+/// [`parse_controller_state`](hyperion_core::input::parse_controller_state). The `hid-input`
+/// `DeviceSource` trait, however, still fills only the stick-only [`InputSample`]
+/// (`next_sample(&mut InputSample)`) — it does **not** surface the `ControllerState` touch/Edge
+/// fields to the engine. So these are left at their inert `Default` here (untouched pad / all-Edge
+/// `false`), which is byte-identical to M5. To make touchpad-as-mouse / the touch-region controls /
+/// the Edge buttons live end-to-end, the `hid-input` backend (a sibling crate, outside the M6
+/// engine-file scope) must expose the decoded contacts — e.g. a `next_state(&mut ControllerState)`
+/// (or extend `InputSample` with `touch`/Edge) — and this function then copies `s.touch` / the Edge
+/// bits across. The whole `hot.rs` → `apply()` path already consumes them, so that is the only
+/// remaining wire.
 #[inline]
 fn hot_input_from_sample(s: &InputSample, is_prime: bool) -> HotInput {
     HotInput {
@@ -190,6 +204,10 @@ fn hot_input_from_sample(s: &InputSample, is_prime: bool) -> HotInput {
         // `pack_xinput` (the single source of truth for the PadButtons→XInput bit layout, §9).
         buttons: hyperion_core::output::pack_xinput(ds_buttons_to_pad(s.buttons.0)),
         raw_buttons: s.buttons.0,
+        // Inert until the `hid-input` backend surfaces the decoded touch/Edge state (see the
+        // maintainer note above). Default == untouched pad / non-Edge — byte-identical to M5.
+        touch: Default::default(),
+        edge: Default::default(),
         dt_us: s.dt_us,
         is_prime,
         dropped: s.dropped,

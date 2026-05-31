@@ -194,25 +194,34 @@ impl UiMouseButton {
     }
 }
 
-/// UI mirror of [`MouseMoveSrc`] (the stick sources; gyro is M5).
+/// UI mirror of [`MouseMoveSrc`] (the stick sources + the touchpad finger drag; gyro is fed via the
+/// `Gyro X/Z` controls, not this combo).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiMouseSrc {
     LeftStick,
     RightStick,
+    /// Touchpad finger drag → relative mouse (M6; tune it on the Touchpad tab).
+    Touchpad,
 }
 
 impl UiMouseSrc {
-    const ALL: [UiMouseSrc; 2] = [UiMouseSrc::LeftStick, UiMouseSrc::RightStick];
+    const ALL: [UiMouseSrc; 3] = [
+        UiMouseSrc::LeftStick,
+        UiMouseSrc::RightStick,
+        UiMouseSrc::Touchpad,
+    ];
     fn label(self) -> &'static str {
         match self {
             UiMouseSrc::LeftStick => "Left stick",
             UiMouseSrc::RightStick => "Right stick",
+            UiMouseSrc::Touchpad => "Touchpad",
         }
     }
     fn to_core(self) -> MouseMoveSrc {
         match self {
             UiMouseSrc::LeftStick => MouseMoveSrc::LeftStick,
             UiMouseSrc::RightStick => MouseMoveSrc::RightStick,
+            UiMouseSrc::Touchpad => MouseMoveSrc::Touchpad,
         }
     }
 }
@@ -456,7 +465,7 @@ fn bind_composer_ui(ui: &mut egui::Ui, salt: &str, c: &mut BindComposer, macros:
         }
         BindKind::MouseMove => {
             ui.horizontal(|ui| {
-                ui.label("Source stick:");
+                ui.label("Source:");
                 egui::ComboBox::from_id_salt((salt, "mousesrc"))
                     .selected_text(c.mouse_src.label())
                     .show_ui(ui, |ui| {
@@ -465,11 +474,16 @@ fn bind_composer_ui(ui: &mut egui::Ui, salt: &str, c: &mut BindComposer, macros:
                         }
                     });
             });
-            ui.label(
-                egui::RichText::new("Tune sensitivity / deadzone in the Mouse tab.")
-                    .weak()
-                    .italics(),
-            );
+            // The relative-mouse tunables live on a different tab depending on the source.
+            let hint = match c.mouse_src {
+                UiMouseSrc::Touchpad => {
+                    "Tune sensitivity / inversion on the Touchpad tab (enable “Touchpad → mouse”)."
+                }
+                UiMouseSrc::LeftStick | UiMouseSrc::RightStick => {
+                    "Tune sensitivity / deadzone in the Mouse tab."
+                }
+            };
+            ui.label(egui::RichText::new(hint).weak().italics());
         }
         BindKind::MouseWheel => {
             ui.horizontal(|ui| {

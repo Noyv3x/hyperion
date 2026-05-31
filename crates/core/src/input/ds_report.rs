@@ -25,10 +25,50 @@
 //! drop/duplicate detection. The `btn*`/`sensor_ts` fields are marked **HW-verify**
 //! (timestamp tick scale and the DSE paddle/Fn/Mute superset in `btn2` are under-documented
 //! for the Edge); the stick bytes 1-4 are **SOLID**.
+//!
+//! ## Touchpad contacts (M6)
+//!
+//! The two finger contacts live in the report tail at the C# `DS4_TOUCHPAD_DATA_OFFSET == 35`
+//! (`DS4Touchpad.cs:106`). The packing per finger is the "simpler touch storing" path in
+//! `DS4Device.cs:1336-1346` (the active per-report path; the alternate `handleTouchpad` history
+//! path uses the SAME offsets):
+//!
+//! | field        | finger 0           | finger 1           | C# expression (`DS4Device.cs`)                |
+//! |--------------|--------------------|--------------------|-----------------------------------------------|
+//! | id byte      | `buf[35]`          | `buf[39]`          | `Id = b & 0x7f`; `IsActive = (b & 0x80) == 0` |
+//! | X (12-bit)   | `buf[36],buf[37]`  | `buf[40],buf[41]`  | `((b_hi & 0x0f) << 8) | b_lo`                 |
+//! | Y (12-bit)   | `buf[37],buf[38]`  | `buf[41],buf[42]`  | `(b_y << 4) | ((b_xhi & 0xf0) >> 4)`          |
+//!
+//! **HW-verify (M6).** Offsets 35..=42 and the **active = high-bit-CLEAR** convention
+//! (`(idbyte & 0x80) == 0`) are taken verbatim from the C# ground truth and need a hardware
+//! capture to confirm against a real DualSense USB `0x01` report tail. The grid is
+//! `x: 0..=1919` / `y: 0..=941` (`RESOLUTION_X_MAX 1920` / `RESOLUTION_Y_MAX 942`,
+//! `DS4Touchpad.cs:107-108`, exclusive max). Touch stays `Default` (`is_active == false`,
+//! `x/y/id == 0`) for any buffer shorter than the touch tail, so a 10-byte test report or a
+//! non-touch source is unchanged.
+//!
+//! ## DualSense Edge superset (M6, gated by `meta.is_edge`)
+//!
+//! Mute/Capture and the Edge Fn/paddle/side buttons are NOT present in the DS4-compatible `0x01`
+//! report this decoder consumes (the C# fork only ever sets `DS4State.Mute/FnL/...` by copying a
+//! prior state — `DS4State.cs:180-187` — it never decodes them from a report byte in the
+//! `0x01` path, because they live in the DualSense Edge **extended** report). The bit layout
+//! below is the published DualSense-Edge extended-report tail and is **HW-verify (M6)**: it is
+//! decoded ONLY when `meta.is_edge` is set, so every non-Edge source (and any Edge source whose
+//! extended bytes are zero) reads them as `false` exactly as before.
 
 use super::normalize::{u8_stick_to_axis, u8_trigger};
-use super::state::ControllerState;
+use super::state::{ControllerState, TouchContact};
 use super::{SourceMeta, StickPair};
+
+/// C# `DS4_TOUCHPAD_DATA_OFFSET` (`DS4Touchpad.cs:106`): first touch byte in the report tail.
+pub const TOUCH_DATA_OFFSET: usize = 35;
+/// Touch grid horizontal span (`RESOLUTION_X_MAX`, exclusive): valid `x` is `0..=1919`.
+pub const TOUCH_RES_X: u16 = 1920;
+/// Touch grid vertical span (`RESOLUTION_Y_MAX`, exclusive): valid `y` is `0..=941`.
+pub const TOUCH_RES_Y: u16 = 942;
+/// Highest report byte the touch tail reads (finger-1 Y high byte `buf[42]`).
+const TOUCH_TAIL_LAST: usize = TOUCH_DATA_OFFSET + 7;
 
 /// DS4-compatible USB input report id.
 pub const DS_USB_REPORT_ID: u8 = 0x01;
@@ -115,6 +155,106 @@ pub fn decode_dpad_hat(nibble: u8) -> (bool, bool, bool, bool) {
     }
 }
 
+/// Decode one touchpad finger contact from its 4-byte slot at `base` (the id byte index).
+///
+/// Ports the C# "simpler touch storing" path (`DS4Device.cs:1336-1346`): `base` is the id byte
+/// (`buf[35]` for finger 0, `buf[39]` for finger 1); the following three bytes carry the 12-bit
+/// X (`base+1` low, low nibble of `base+2`) and 12-bit Y (high nibble of `base+2`, `base+3`).
+/// **Active is high-bit-CLEAR** (`(idbyte & 0x80) == 0`), matching the C# `IsActive`. `x`/`y` are
+/// clamped to the grid (`0..=1919` / `0..=941`) so a malformed report can never index past the
+/// region split. Returns the `Default` (inactive) contact when the slot is past the buffer end.
+#[inline]
+fn decode_touch_contact(buf: &[u8], base: usize) -> TouchContact {
+    if base + 3 >= buf.len() {
+        return TouchContact::default();
+    }
+    let id_byte = buf[base];
+    let x = (u16::from(buf[base + 2] & 0x0F) << 8) | u16::from(buf[base + 1]);
+    let y = (u16::from(buf[base + 3]) << 4) | (u16::from(buf[base + 2] & 0xF0) >> 4);
+    TouchContact {
+        is_active: id_byte & 0x80 == 0,
+        id: id_byte & 0x7F,
+        x: x.min(TOUCH_RES_X - 1),
+        y: y.min(TOUCH_RES_Y - 1),
+    }
+}
+
+/// Decode both touchpad contacts from the report tail (HW-verify, M6).
+///
+/// Returns the two `[TouchContact; 2]` from offsets `35,39` (`DS4_TOUCHPAD_DATA_OFFSET`). A buffer
+/// that does not reach the touch tail (`< 43` bytes) yields two `Default` (inactive) contacts, so
+/// short test reports and non-touch sources keep their M5 `Default` behavior.
+#[inline]
+fn decode_touch(buf: &[u8]) -> [TouchContact; 2] {
+    if buf.len() <= TOUCH_TAIL_LAST {
+        return [TouchContact::default(); 2];
+    }
+    [
+        decode_touch_contact(buf, TOUCH_DATA_OFFSET),
+        decode_touch_contact(buf, TOUCH_DATA_OFFSET + 4),
+    ]
+}
+
+// --- DualSense Edge extended-report superset bit positions (HW-verify, M6) -----------------------
+//
+// These are decoded ONLY when `meta.is_edge` (so non-Edge output is byte-identical). The Edge
+// extended report is LONGER than the 64-byte DS4-compat frame; the Fn/paddle/Mute bits live in a
+// tail byte PAST the touch data so they cannot collide with any DS4-compat field (notably `r2` at
+// byte 9). Pinned as named constants so a hardware capture only edits one place; offsets are
+// HW-verify (the precise Edge tail byte must be confirmed against a real DualSense Edge capture).
+/// Edge extended byte carrying Mute + Fn + paddle bits (`buf[EDGE_FN_BYTE]`, past the touch tail).
+const EDGE_FN_BYTE: usize = TOUCH_TAIL_LAST + 1;
+/// Mute button bit within [`EDGE_FN_BYTE`].
+const EDGE_MUTE: u8 = 0x04;
+/// Left function button bit.
+const EDGE_FN_L: u8 = 0x10;
+/// Right function button bit.
+const EDGE_FN_R: u8 = 0x20;
+/// Back-left paddle bit.
+const EDGE_BLP: u8 = 0x40;
+/// Back-right paddle bit.
+const EDGE_BRP: u8 = 0x80;
+/// Capture (Create-extra) bit, riding `btn2` alongside PS/Touch (`buf[7] & 0x04`).
+const EDGE_CAPTURE: u8 = 0x04;
+
+/// The decoded DualSense-Edge superset (Mute/Capture + Fn/paddle/side), all `false` unless the
+/// source is Edge-capable. HW-verify (M6): see the module-level Edge note.
+#[derive(Clone, Copy, Debug, Default)]
+struct EdgeBits {
+    mute: bool,
+    capture: bool,
+    fn_l: bool,
+    fn_r: bool,
+    blp: bool,
+    brp: bool,
+    side_l: bool,
+    side_r: bool,
+}
+
+/// Decode the Edge superset from the extended report tail, gated by `is_edge`.
+///
+/// For a non-Edge source (or a buffer too short for the extended byte) every field is `false`, so
+/// the decode is purely additive over M5. Side buttons (`side_l`/`side_r`) have no published stable
+/// bit in this tail and stay `false` pending a hardware capture (documented for the maintainer).
+#[inline]
+fn decode_edge_bits(r: &DsReport, buf: &[u8], is_edge: bool) -> EdgeBits {
+    if !is_edge || buf.len() <= EDGE_FN_BYTE {
+        return EdgeBits::default();
+    }
+    let fb = buf[EDGE_FN_BYTE];
+    EdgeBits {
+        mute: fb & EDGE_MUTE != 0,
+        capture: r.btn2 & EDGE_CAPTURE != 0,
+        fn_l: fb & EDGE_FN_L != 0,
+        fn_r: fb & EDGE_FN_R != 0,
+        blp: fb & EDGE_BLP != 0,
+        brp: fb & EDGE_BRP != 0,
+        // No published stable bit yet — HW-verify follow-up (kept inert, never guessed-on).
+        side_l: false,
+        side_r: false,
+    }
+}
+
 /// Decode buttons + triggers + (capability-gated) sensors/touch from an already-parsed
 /// [`DsReport`] plus the full report buffer into the structured [`ControllerState`].
 ///
@@ -131,14 +271,17 @@ pub fn decode_dpad_hat(nibble: u8) -> (bool, bool, bool, bool) {
 /// extended Edge report; they are decoded only when `meta.is_edge` is set, else read `false`.
 /// Touch contacts and motion sensors are HW-verify (M5/M6) — left at their `Default` (`0`)
 /// until those decodes land, so the Control variants are valid indices but inert.
-pub fn decode_controller_state(r: &DsReport, _buf: &[u8], meta: &SourceMeta) -> ControllerState {
+pub fn decode_controller_state(r: &DsReport, buf: &[u8], meta: &SourceMeta) -> ControllerState {
     let (left, right) = ds_report_to_sticks(r);
     let (dpad_up, dpad_right, dpad_down, dpad_left) = decode_dpad_hat(r.btn0);
 
-    // The Edge superset (Mute/Capture, Fn/paddle/side) is decoded only for Edge-capable
-    // sources; the bit positions live in the extended report and land in M6. Until then every
-    // gated field reads `false` even on an Edge source, but the gate is wired so M6 is additive.
-    let _is_edge = meta.is_edge;
+    // The Edge superset (Mute/Capture, Fn/paddle/side) is decoded only for Edge-capable sources
+    // from the extended report tail (HW-verify); a non-Edge source reads every gated field `false`,
+    // so this is byte-identical to M5 for the common DS4-compat path.
+    let edge = decode_edge_bits(r, buf, meta.is_edge);
+    // Touch contacts from the report tail (offsets 35..=42, HW-verify); two inactive `Default`
+    // contacts for any buffer that does not reach the tail (M5 behavior preserved).
+    let touch = decode_touch(buf);
 
     ControllerState {
         lx: left.x,
@@ -168,17 +311,17 @@ pub fn decode_controller_state(r: &DsReport, _buf: &[u8], meta: &SourceMeta) -> 
         // System (btn2).
         ps: r.btn2 & 0x01 != 0,
         touch_button: r.btn2 & 0x02 != 0,
-        // Edge superset (HW-verify) — inert until the M6 extended-report decode lands.
-        mute: false,
-        capture: false,
-        fn_l: false,
-        fn_r: false,
-        blp: false,
-        brp: false,
-        side_l: false,
-        side_r: false,
-        // Touch contacts + motion: HW-verify (M5/M6), inert at Default.
-        touch: Default::default(),
+        // Edge superset (HW-verify, M6) — `false` for every non-Edge source via `decode_edge_bits`.
+        mute: edge.mute,
+        capture: edge.capture,
+        fn_l: edge.fn_l,
+        fn_r: edge.fn_r,
+        blp: edge.blp,
+        brp: edge.brp,
+        side_l: edge.side_l,
+        side_r: edge.side_r,
+        // Touch contacts (HW-verify, M6) from the report tail; motion stays Default (M5 HW-verify).
+        touch,
         motion: Default::default(),
     }
 }
@@ -202,7 +345,21 @@ mod tests {
         b[9] = r2;
         b[10] = (ts & 0xFF) as u8;
         b[11] = (ts >> 8) as u8;
+        // Idle-pad touch tail: high bit SET on both id bytes (== inactive, the C# `IsActive` is
+        // high-bit-CLEAR), so an unfilled report decodes two `Default` (inactive) contacts and the
+        // M5 touch == Default behavior holds for every test that does not drive the touchpad.
+        b[TOUCH_DATA_OFFSET] = 0x80;
+        b[TOUCH_DATA_OFFSET + 4] = 0x80;
         b
+    }
+
+    /// Place an ACTIVE finger contact into a report buffer at the given finger slot (0 or 1).
+    fn set_touch(b: &mut [u8; 64], finger: usize, id: u8, x: u16, y: u16) {
+        let base = TOUCH_DATA_OFFSET + finger * 4;
+        b[base] = id & 0x7F; // high bit clear => active
+        b[base + 1] = (x & 0xFF) as u8;
+        b[base + 2] = (((y & 0x0F) << 4) | ((x >> 8) & 0x0F)) as u8;
+        b[base + 3] = (y >> 4) as u8;
     }
 
     #[test]
@@ -403,5 +560,101 @@ mod tests {
         assert!(!s.pressed(Control::R2FullPull, &t)); // 100 != 255
                                                       // analog ~ raw/255 within 1e-12.
         assert!((s.analog(Control::R2) - 100.0 / 255.0).abs() < 1e-12);
+    }
+
+    // ------------------------------------ M6: touch contacts -------------------------------------
+
+    #[test]
+    fn idle_report_decodes_two_inactive_contacts() {
+        // The synth fixture writes the idle (high-bit-set) touch tail, so a plain report is two
+        // inactive Default contacts (M5 behavior preserved).
+        let s = decode(&synth_btn(8, 0, 0));
+        assert_eq!(s.touch, [TouchContact::default(); 2]);
+    }
+
+    #[test]
+    fn active_contact_decodes_id_and_12bit_xy() {
+        // Finger 0 active, id 0x2A, x = 0x123 (291), y = 0x0F5 (245).
+        let mut b = synth_btn(8, 0, 0);
+        set_touch(&mut b, 0, 0x2A, 0x123, 0x0F5);
+        let s = decode(&b);
+        assert!(s.touch[0].is_active, "high-bit-clear id => active");
+        assert_eq!(s.touch[0].id, 0x2A);
+        assert_eq!(s.touch[0].x, 0x123);
+        assert_eq!(s.touch[0].y, 0x0F5);
+        // Finger 1 untouched stays inactive.
+        assert!(!s.touch[1].is_active);
+    }
+
+    #[test]
+    fn both_fingers_decode_independently() {
+        let mut b = synth_btn(8, 0, 0);
+        set_touch(&mut b, 0, 1, 100, 50);
+        set_touch(&mut b, 1, 2, 1900, 900);
+        let s = decode(&b);
+        assert!(s.touch[0].is_active && s.touch[1].is_active);
+        assert_eq!((s.touch[0].id, s.touch[0].x, s.touch[0].y), (1, 100, 50));
+        assert_eq!((s.touch[1].id, s.touch[1].x, s.touch[1].y), (2, 1900, 900));
+    }
+
+    #[test]
+    fn touch_xy_clamped_to_grid() {
+        // A bogus all-ones X/Y (0xFFF == 4095) clamps to the grid maxima, never past the region.
+        let mut b = synth_btn(8, 0, 0);
+        set_touch(&mut b, 0, 0, 0xFFF, 0xFFF);
+        let s = decode(&b);
+        assert_eq!(s.touch[0].x, TOUCH_RES_X - 1, "x clamps to 1919");
+        assert_eq!(s.touch[0].y, TOUCH_RES_Y - 1, "y clamps to 941");
+    }
+
+    #[test]
+    fn short_buffer_keeps_default_touch() {
+        // A buffer that parses (>= 64) but whose tail is the idle encoding yields Default; and the
+        // tail-length guard means a hypothetical short slice never panics.
+        assert_eq!(decode_touch(&[0u8; 10]), [TouchContact::default(); 2]);
+        assert_eq!(decode_touch(&[0u8; 40]), [TouchContact::default(); 2]);
+    }
+
+    // ----------------------------- M6: DualSense Edge superset (gated) ----------------------------
+
+    const EDGE_META: SourceMeta = SourceMeta {
+        vid: 0x054C,
+        pid: 0x0DF2,
+        name: "edge",
+        stick_bits: 8,
+        is_edge: true,
+    };
+
+    fn decode_edge(b: &[u8]) -> ControllerState {
+        let r = parse_ds_usb_report(b).unwrap();
+        decode_controller_state(&r, b, &EDGE_META)
+    }
+
+    #[test]
+    fn edge_bits_decode_only_when_edge_capable() {
+        // Set every Fn/paddle/Mute bit in the extended byte + the Capture bit in btn2.
+        let mut b = synth_btn(8, 0, EDGE_CAPTURE);
+        b[EDGE_FN_BYTE] = EDGE_MUTE | EDGE_FN_L | EDGE_FN_R | EDGE_BLP | EDGE_BRP;
+
+        // Non-Edge source: every gated field stays false (byte-identical to M5).
+        let non_edge = decode(&b);
+        assert!(!non_edge.mute && !non_edge.capture && !non_edge.fn_l && !non_edge.fn_r);
+        assert!(!non_edge.blp && !non_edge.brp);
+
+        // Edge source: the bits decode.
+        let edge = decode_edge(&b);
+        assert!(edge.mute && edge.capture && edge.fn_l && edge.fn_r && edge.blp && edge.brp);
+        // Side buttons remain inert (no published bit — HW-verify follow-up).
+        assert!(!edge.side_l && !edge.side_r);
+    }
+
+    #[test]
+    fn edge_individual_bits_isolated() {
+        let only_mute = {
+            let mut b = synth_btn(8, 0, 0);
+            b[EDGE_FN_BYTE] = EDGE_MUTE;
+            decode_edge(&b)
+        };
+        assert!(only_mute.mute && !only_mute.fn_l && !only_mute.blp && !only_mute.capture);
     }
 }

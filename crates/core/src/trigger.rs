@@ -72,6 +72,46 @@ impl From<TriggerCurve> for OutputCurve {
     }
 }
 
+/// Two-stage / hip-fire trigger mode (M6; ports the C# `TwoStageTriggerMode`,
+/// `ProfilePropGroups.cs:1157`). The default [`TriggerMode::Normal`] is byte-identical to M5:
+/// a single digital stage at `max(button_threshold, dead_zone)`, soft == full.
+///
+/// * `TwoStage` — a **soft-pull** digital stage at `soft_threshold` plus a **full-pull** stage at
+///   the raw `255` full-pull; both can be active at once (soft stays on as the trigger crosses to
+///   full), so a binding can map "light pull" and "hard pull" to different actions.
+/// * `HipFire` — time-gated: when the trigger first engages past the soft threshold a window opens;
+///   if the **full pull** lands within `hip_fire_us` only the full-pull stage fires (the soft stage
+///   is suppressed — a fast "hip fire"); if the window elapses while only the soft pull is held the
+///   soft stage fires (an "aim-then-shoot"). Net-new timing uses the resident [`TriggerState`].
+///
+/// The variant order/names are an append-only persisted-profile contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum TriggerMode {
+    /// Single digital stage (M5 behavior; soft == full). Default.
+    #[default]
+    Normal,
+    /// Independent soft-pull + full-pull stages.
+    TwoStage,
+    /// Time-gated soft/full stages (fast full pull suppresses soft).
+    HipFire,
+    /// Append-only fallback for an unknown persisted mode (degrades to `Normal`).
+    #[serde(other)]
+    Unknown,
+}
+
+/// The staged result of [`process_trigger_staged`]: the analog `[0,1]` output plus the two digital
+/// stages. For [`TriggerMode::Normal`] `soft_pull == full_pull` is the single M5 digital view.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TriggerOutput {
+    /// Analog output in `[0,1]` (rounded only at egress) — identical across all modes.
+    pub analog: f64,
+    /// Soft-pull digital stage (the light-pull / first stage).
+    pub soft_pull: bool,
+    /// Full-pull digital stage (the hard-pull / second stage).
+    pub full_pull: bool,
+}
+
 /// Full per-trigger settings (one per L2 / R2), placed inside a `Profile`.
 ///
 /// `Copy` and small so the hot loop copies it into the resident `[TriggerSettings; 2]`. Defaults
@@ -94,6 +134,21 @@ pub struct TriggerSettings {
     /// Digital activation threshold in `[0,255]` raw units (trigger-as-button). `0` uses the
     /// kind-default 100/255 at resolve time; the to-button compare uses `max(button_threshold, dead_zone)`.
     pub button_threshold: u8,
+    /// Two-stage / hip-fire mode (M6). `Normal` (default) is byte-identical to M5.
+    #[serde(default)]
+    pub mode: TriggerMode,
+    /// Soft-pull digital threshold in `[0,255]` raw units (the first stage in `TwoStage`/`HipFire`).
+    /// Ignored in `Normal`. `0` falls back to `button_threshold` at process time.
+    #[serde(default)]
+    pub soft_threshold: u8,
+    /// Hip-fire window in microseconds (the `HipFire` full-vs-soft race; C# `hipFireMS·1000`).
+    #[serde(default = "default_hip_fire_us")]
+    pub hip_fire_us: u32,
+}
+
+/// C# `DEFAULT_HIP_TIME` (100 ms) expressed in microseconds.
+const fn default_hip_fire_us() -> u32 {
+    100_000
 }
 
 impl Default for TriggerSettings {
@@ -108,6 +163,9 @@ impl Default for TriggerSettings {
             curve: TriggerCurve::Linear,
             // 100/255 ≈ 0.3922 — the C# `triggers > 100` digital threshold.
             button_threshold: 100,
+            mode: TriggerMode::Normal,
+            soft_threshold: 0,
+            hip_fire_us: default_hip_fire_us(),
         }
     }
 }
@@ -119,6 +177,9 @@ impl TriggerSettings {
         out.anti_dead_zone = out.anti_dead_zone.clamp(0, 100);
         out.max_zone = out.max_zone.clamp(1, 100);
         out.max_output = out.max_output.clamp(0.0, 100.0);
+        // Hip-fire window floors at 1 ms so the race is always decidable in a bounded number of
+        // reports (and clamps to a sane upper bound).
+        out.hip_fire_us = out.hip_fire_us.clamp(1_000, 5_000_000);
         out
     }
 }
@@ -126,16 +187,21 @@ impl TriggerSettings {
 /// Per-trigger mutable state (resident, one per L2 / R2).
 ///
 /// **`Default` is the clean post-reset state.** `last_pressed` tracks digital edges; `elapsed_us`
-/// is the monotonic accumulator reserved for the two-stage / hip-fire modes (M6).
+/// is the monotonic accumulator; the `hip_*` fields drive the M6 hip-fire race (all bounded, no
+/// real time / no threads — see [`process_trigger_staged`]).
 #[derive(Default, Clone, Copy, Debug)]
 pub struct TriggerState {
     /// Whether the trigger read pressed on the previous report (edge tracking).
     pub last_pressed: bool,
-    /// Monotonic microsecond accumulator (reserved for two-stage timing, M6).
+    /// Monotonic microsecond accumulator (advanced by the per-report `dt`).
     pub elapsed_us: i64,
+    /// Whether the hip-fire window is currently open (set on soft-engage, cleared on release).
+    pub hip_active: bool,
+    /// `elapsed_us` snapshot when the current soft engage began (the hip-fire window anchor).
+    pub hip_start_us: i64,
 }
 
-/// Process one trigger report through the ordered chain.
+/// Process one trigger report through the ordered chain (the M5 `(analog, digital)` view).
 ///
 /// * `raw` — the trigger reading in `[0,1]` (`cState.L2 / 255.0`).
 /// * `cfg` — the per-trigger settings (already `clamped()`).
@@ -143,13 +209,38 @@ pub struct TriggerState {
 /// * `dt` — the guarded per-report elapsed time (advances `elapsed_us`).
 ///
 /// Returns `(analog_out, digital_pressed)`: `analog_out` in `[0,1]` (rounded only at egress),
-/// `digital_pressed` from the to-button threshold `raw255 >= max(button_threshold, dead_zone)`.
+/// `digital_pressed` is the OR of the two staged digital pulls. For the default
+/// [`TriggerMode::Normal`] this is byte-identical to M5 (single stage at
+/// `max(button_threshold, dead_zone)`); the two-stage / hip-fire detail is in
+/// [`process_trigger_staged`].
 pub fn process_trigger(
     raw: f64,
     cfg: &TriggerSettings,
     st: &mut TriggerState,
     dt: Dt,
 ) -> (f64, bool) {
+    let out = process_trigger_staged(raw, cfg, st, dt);
+    (out.analog, out.soft_pull || out.full_pull)
+}
+
+/// Process one trigger report into the full staged [`TriggerOutput`] (M6).
+///
+/// The analog chain is identical to M5 (and to `process_trigger`); the digital result depends on
+/// [`TriggerSettings::mode`]:
+/// * `Normal` — `soft_pull == full_pull ==` the M5 to-button compare. Byte-identical to M5.
+/// * `TwoStage` — `soft_pull` at `soft_threshold` (or `button_threshold` if 0), `full_pull` at the
+///   raw `255` full pull; both independent.
+/// * `HipFire` — opens a `hip_fire_us` window on soft engage; a full pull inside the window fires
+///   ONLY `full_pull`; if the window elapses with only the soft pull held, `soft_pull` fires.
+///
+/// Hip-fire timing reads only the resident `st.elapsed_us` accumulator (advanced by the guarded
+/// per-report `dt`), so the decision is pure and bounded — no wall clock, no threads.
+pub fn process_trigger_staged(
+    raw: f64,
+    cfg: &TriggerSettings,
+    st: &mut TriggerState,
+    dt: Dt,
+) -> TriggerOutput {
     st.elapsed_us = st.elapsed_us.wrapping_add(dt.us() as i64);
 
     let raw = raw.clamp(0.0, 1.0);
@@ -212,13 +303,100 @@ pub fn process_trigger(
 
     let analog_out = output.clamp(0.0, 1.0);
 
-    // --- to-button threshold ---
-    // raw255 vs max(button_threshold, dead_zone) (pre-quantization f64 for determinism).
-    let threshold = (cfg.button_threshold as f64).max(dead_zone);
-    let pressed = raw255 >= threshold && threshold > 0.0;
-    st.last_pressed = pressed;
+    // --- to-button threshold(s) ---
+    // Base digital compare: raw255 vs max(button_threshold, dead_zone) (pre-quantization f64).
+    let base_threshold = (cfg.button_threshold as f64).max(dead_zone);
+    let base_pressed = raw255 >= base_threshold && base_threshold > 0.0;
 
-    (analog_out, pressed)
+    let out = match cfg.mode {
+        TriggerMode::Normal | TriggerMode::Unknown => TriggerOutput {
+            analog: analog_out,
+            soft_pull: base_pressed,
+            full_pull: base_pressed,
+        },
+        TriggerMode::TwoStage => {
+            // Soft stage at soft_threshold (or the base threshold when unset); full stage at 255.
+            let soft_th = if cfg.soft_threshold > 0 {
+                (cfg.soft_threshold as f64).max(dead_zone)
+            } else {
+                base_threshold
+            };
+            let soft = raw255 >= soft_th && soft_th > 0.0;
+            let full = raw255 >= 255.0;
+            TriggerOutput {
+                analog: analog_out,
+                soft_pull: soft,
+                full_pull: full,
+            }
+        }
+        TriggerMode::HipFire => {
+            hip_fire_stage(raw255, dead_zone, base_threshold, cfg, st, analog_out)
+        }
+    };
+
+    // Edge tracking reflects "any digital stage engaged".
+    st.last_pressed = out.soft_pull || out.full_pull;
+    out
+}
+
+/// The hip-fire stage machine (M6): a pure, bounded full-vs-soft race off the resident
+/// `st.elapsed_us` accumulator.
+///
+/// On the rising edge of the soft engage the window opens (`hip_active`, anchored to `elapsed_us`).
+/// While engaged: a full pull (`raw255 == 255`) inside `hip_fire_us` fires ONLY `full_pull`; once
+/// the window elapses with only the soft pull held, `soft_pull` fires. Release (below the soft
+/// threshold) closes the window so the next engage re-anchors.
+#[inline]
+fn hip_fire_stage(
+    raw255: f64,
+    dead_zone: f64,
+    base_threshold: f64,
+    cfg: &TriggerSettings,
+    st: &mut TriggerState,
+    analog_out: f64,
+) -> TriggerOutput {
+    let soft_th = if cfg.soft_threshold > 0 {
+        (cfg.soft_threshold as f64).max(dead_zone)
+    } else {
+        base_threshold
+    };
+    let engaged = soft_th > 0.0 && raw255 >= soft_th;
+    let full = raw255 >= 255.0;
+
+    if !engaged {
+        // Below the soft threshold: window closed, nothing fires.
+        st.hip_active = false;
+        return TriggerOutput {
+            analog: analog_out,
+            soft_pull: false,
+            full_pull: false,
+        };
+    }
+
+    // Engaged: open the window on the rising edge.
+    if !st.hip_active {
+        st.hip_active = true;
+        st.hip_start_us = st.elapsed_us;
+    }
+    let elapsed = st.elapsed_us.wrapping_sub(st.hip_start_us);
+    let within_window = elapsed < i64::from(cfg.hip_fire_us);
+
+    let (soft_pull, full_pull) = if full {
+        // A full pull suppresses the soft stage (fast hip fire) regardless of the window.
+        (false, true)
+    } else if within_window {
+        // Still racing: hold both stages off until the full pull lands or the window elapses.
+        (false, false)
+    } else {
+        // Window elapsed with only a soft pull held -> the soft (aim) stage fires.
+        (true, false)
+    };
+
+    TriggerOutput {
+        analog: analog_out,
+        soft_pull,
+        full_pull,
+    }
 }
 
 /// Trigger output curve (C# `l2OutCurveMode` math), `[0,1] -> [0,1]`.
@@ -395,5 +573,172 @@ mod tests {
         let st = TriggerState::default();
         assert!(!st.last_pressed);
         assert_eq!(st.elapsed_us, 0);
+        assert!(!st.hip_active);
+        assert_eq!(st.hip_start_us, 0);
+    }
+
+    // -------------------------------- M6: two-stage / hip-fire modes -----------------------------
+
+    #[test]
+    fn default_mode_is_normal_and_byte_identical() {
+        // The default settings are Normal: process_trigger_staged's soft == full == the M5 digital,
+        // and process_trigger returns exactly the M5 (analog, digital) pair.
+        let cfg = TriggerSettings::default();
+        assert_eq!(cfg.mode, TriggerMode::Normal);
+        let mut st = TriggerState::default();
+        let mut st2 = TriggerState::default();
+        for raw in [0.0, 99.0 / 255.0, 100.0 / 255.0, 0.5, 1.0] {
+            let staged = process_trigger_staged(raw, &cfg, &mut st, dt());
+            let (a, p) = process_trigger(raw, &cfg, &mut st2, dt());
+            assert_eq!(staged.soft_pull, staged.full_pull, "Normal: soft == full");
+            assert!(approx(staged.analog, a));
+            assert_eq!(staged.soft_pull || staged.full_pull, p);
+        }
+    }
+
+    #[test]
+    fn two_stage_soft_then_full() {
+        let cfg = TriggerSettings {
+            mode: TriggerMode::TwoStage,
+            soft_threshold: 60,
+            ..TriggerSettings::default()
+        };
+        let mut st = TriggerState::default();
+        // Below soft -> neither.
+        let o0 = process_trigger_staged(50.0 / 255.0, &cfg, &mut st, dt());
+        assert!(!o0.soft_pull && !o0.full_pull);
+        // Past soft, not full -> soft only.
+        let o1 = process_trigger_staged(150.0 / 255.0, &cfg, &mut st, dt());
+        assert!(o1.soft_pull && !o1.full_pull, "soft engaged, full not yet");
+        // Full pull -> BOTH stages (soft stays on through to full).
+        let o2 = process_trigger_staged(1.0, &cfg, &mut st, dt());
+        assert!(
+            o2.soft_pull && o2.full_pull,
+            "full pull engages both stages"
+        );
+    }
+
+    #[test]
+    fn two_stage_full_requires_raw_255() {
+        let cfg = TriggerSettings {
+            mode: TriggerMode::TwoStage,
+            soft_threshold: 40,
+            ..TriggerSettings::default()
+        };
+        let mut st = TriggerState::default();
+        // 254/255 is past soft but not a full pull.
+        let o = process_trigger_staged(254.0 / 255.0, &cfg, &mut st, dt());
+        assert!(o.soft_pull && !o.full_pull);
+    }
+
+    #[test]
+    fn hip_fire_fast_full_pull_suppresses_soft() {
+        // A full pull on the very first engaged report (within the window) fires only full_pull.
+        let cfg = TriggerSettings {
+            mode: TriggerMode::HipFire,
+            soft_threshold: 60,
+            hip_fire_us: 100_000,
+            ..TriggerSettings::default()
+        }
+        .clamped();
+        let mut st = TriggerState::default();
+        // dt() is 4ms; one report engaged + full immediately -> full only, soft suppressed.
+        let o = process_trigger_staged(1.0, &cfg, &mut st, dt());
+        assert!(o.full_pull && !o.soft_pull, "fast full pull -> full only");
+    }
+
+    #[test]
+    fn hip_fire_held_soft_fires_after_window() {
+        // Hold only the soft pull. The window opens on the engage report (when elapsed first
+        // reaches 4ms, so hip_start == 4ms) and elapses when elapsed - 4ms >= 10ms, i.e. at
+        // elapsed == 14ms -> report 4 (16ms). Reports 1..3 race; report 4 fires the soft (aim) stage.
+        let cfg = TriggerSettings {
+            mode: TriggerMode::HipFire,
+            soft_threshold: 60,
+            hip_fire_us: 10_000,
+            ..TriggerSettings::default()
+        }
+        .clamped();
+        let mut st = TriggerState::default();
+        let soft = 150.0 / 255.0; // past soft, not full
+        for report in 1..=3 {
+            let o = process_trigger_staged(soft, &cfg, &mut st, dt());
+            assert!(
+                !o.soft_pull && !o.full_pull,
+                "still racing at report {report}"
+            );
+        }
+        let o4 = process_trigger_staged(soft, &cfg, &mut st, dt()); // elapsed 16ms, window elapsed
+        assert!(o4.soft_pull && !o4.full_pull, "soft fires after the window");
+    }
+
+    #[test]
+    fn hip_fire_release_recloses_window() {
+        let cfg = TriggerSettings {
+            mode: TriggerMode::HipFire,
+            soft_threshold: 60,
+            hip_fire_us: 10_000,
+            ..TriggerSettings::default()
+        }
+        .clamped();
+        let mut st = TriggerState::default();
+        let soft = 150.0 / 255.0;
+        // Engage and let the window elapse so soft fires.
+        for _ in 0..4 {
+            process_trigger_staged(soft, &cfg, &mut st, dt());
+        }
+        assert!(st.hip_active);
+        // Release below soft -> window closes, nothing fires.
+        let rel = process_trigger_staged(0.0, &cfg, &mut st, dt());
+        assert!(!rel.soft_pull && !rel.full_pull && !st.hip_active);
+        // Re-engage then immediately full -> full only again (window re-anchored).
+        let o = process_trigger_staged(1.0, &cfg, &mut st, dt());
+        assert!(
+            o.full_pull && !o.soft_pull,
+            "re-engaged window suppresses soft"
+        );
+    }
+
+    #[test]
+    fn mode_serde_round_trip_and_unknown_fallback() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct W {
+            m: TriggerMode,
+        }
+        for m in [
+            TriggerMode::Normal,
+            TriggerMode::TwoStage,
+            TriggerMode::HipFire,
+        ] {
+            let s = toml::to_string(&W { m }).unwrap();
+            let back: W = toml::from_str(&s).unwrap();
+            assert_eq!(back.m, m);
+        }
+        let back: W = toml::from_str("m = \"SomeFutureMode\"\n").unwrap();
+        assert_eq!(back.m, TriggerMode::Unknown);
+    }
+
+    #[test]
+    fn clamped_floors_hip_fire_window() {
+        let cfg = TriggerSettings {
+            hip_fire_us: 0,
+            ..TriggerSettings::default()
+        }
+        .clamped();
+        assert_eq!(cfg.hip_fire_us, 1_000, "hip-fire window floors at 1ms");
+    }
+
+    #[test]
+    fn unknown_mode_behaves_like_normal() {
+        let cfg = TriggerSettings {
+            mode: TriggerMode::Unknown,
+            ..TriggerSettings::default()
+        };
+        let mut st = TriggerState::default();
+        let o = process_trigger_staged(0.5, &cfg, &mut st, dt());
+        assert_eq!(
+            o.soft_pull, o.full_pull,
+            "Unknown degrades to a single stage"
+        );
     }
 }

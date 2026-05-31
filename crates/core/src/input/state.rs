@@ -27,6 +27,21 @@ pub struct TouchContact {
     pub y: u16,
 }
 
+/// The four touchpad finger-region flags derived from the active contact position (M6). Internal
+/// helper for [`ControllerState::touch_region`]; the public surface is the `TouchLeft/Right/Upper/
+/// Multi` controls read through [`ControllerState::pressed`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TouchRegion {
+    /// Active contact is in the left band (`x < 768`).
+    left: bool,
+    /// Active contact is in the right band (`x >= 768`).
+    right: bool,
+    /// Active contact is in the upper half (`y < 471`).
+    upper: bool,
+    /// Two fingers are active simultaneously.
+    multi: bool,
+}
+
 /// Decoded motion sensors (blueprint §3.2). Calibrated angular rate is rad/s and acceleration
 /// is g; the raw `i16` ticks are retained so the full-scale constants can be corrected without
 /// re-decoding (HW-verify, M5).
@@ -216,7 +231,46 @@ impl ControllerState {
             SideL => self.side_l,
             SideR => self.side_r,
             TouchButton => self.touch_button,
+            // Touchpad finger-region controls, derived from the active contact position (M6).
+            TouchLeft => self.touch_region().left,
+            TouchRight => self.touch_region().right,
+            TouchUpper => self.touch_region().upper,
+            TouchMulti => self.touch_region().multi,
             _ => false,
+        }
+    }
+
+    /// Derive the touchpad finger-region flags from the live [`TouchContact`]s (M6).
+    ///
+    /// Ports the C# region split (`DS4Device.cs:1384-1385`, `DS4Touchpad` halves): `left` is the
+    /// near `< RES_X·2/5` (`768`) X band, `right` its complement, `upper` the top half
+    /// (`y < RES_Y/2 == 471`); `multi` is `2+` active contacts (`Touch2Fingers`). The flags read
+    /// the **first active** contact (finger 0 if active, else finger 1); with no active contact
+    /// every flag is `false`, so an untouched pad is inert and an unconfigured profile is unchanged.
+    #[inline]
+    fn touch_region(&self) -> TouchRegion {
+        // Horizontal split point: RESOLUTION_X_MAX * 2 / 5 == 1920 * 2 / 5 == 768.
+        const X_SPLIT: u16 = 768;
+        // Vertical half: RESOLUTION_Y_MAX / 2 == 942 / 2 == 471.
+        const Y_HALF: u16 = 471;
+
+        let active0 = self.touch[0].is_active;
+        let active1 = self.touch[1].is_active;
+        let primary = if active0 {
+            Some(&self.touch[0])
+        } else if active1 {
+            Some(&self.touch[1])
+        } else {
+            None
+        };
+        match primary {
+            Some(c) => TouchRegion {
+                left: c.x < X_SPLIT,
+                right: c.x >= X_SPLIT,
+                upper: c.y < Y_HALF,
+                multi: active0 && active1,
+            },
+            None => TouchRegion::default(),
         }
     }
 
@@ -465,6 +519,77 @@ mod tests {
         assert_eq!(btn1 & 0x20, 0x20, "options bit");
         assert_eq!(btn2 & 0x01, 0x01, "PS bit");
         assert_eq!(btn2 & 0x02, 0x02, "touch button bit");
+    }
+
+    // ------------------------------ M6: touchpad finger-region controls --------------------------
+
+    fn touched(x: u16, y: u16) -> TouchContact {
+        TouchContact {
+            is_active: true,
+            id: 1,
+            x,
+            y,
+        }
+    }
+
+    #[test]
+    fn touch_region_inert_with_no_active_contact() {
+        let t = Thresholds::default();
+        let s = neutral();
+        for c in [
+            Control::TouchLeft,
+            Control::TouchRight,
+            Control::TouchUpper,
+            Control::TouchMulti,
+        ] {
+            assert!(!s.pressed(c, &t), "{c:?} must be inert on an untouched pad");
+        }
+    }
+
+    #[test]
+    fn touch_left_right_split_at_768() {
+        let t = Thresholds::default();
+        let mut s = neutral();
+        // x just left of the 768 split -> Left, not Right.
+        s.touch[0] = touched(700, 400);
+        assert!(s.pressed(Control::TouchLeft, &t));
+        assert!(!s.pressed(Control::TouchRight, &t));
+        // x at/past the split -> Right, not Left.
+        s.touch[0] = touched(768, 400);
+        assert!(s.pressed(Control::TouchRight, &t));
+        assert!(!s.pressed(Control::TouchLeft, &t));
+    }
+
+    #[test]
+    fn touch_upper_half_at_471() {
+        let t = Thresholds::default();
+        let mut s = neutral();
+        s.touch[0] = touched(500, 400); // y < 471 -> upper
+        assert!(s.pressed(Control::TouchUpper, &t));
+        s.touch[0] = touched(500, 471); // y == 471 -> not upper
+        assert!(!s.pressed(Control::TouchUpper, &t));
+    }
+
+    #[test]
+    fn touch_multi_requires_two_active_contacts() {
+        let t = Thresholds::default();
+        let mut s = neutral();
+        s.touch[0] = touched(100, 100);
+        assert!(!s.pressed(Control::TouchMulti, &t), "one finger != multi");
+        s.touch[1] = touched(1800, 800);
+        assert!(s.pressed(Control::TouchMulti, &t), "two fingers == multi");
+    }
+
+    #[test]
+    fn touch_region_reads_first_active_finger() {
+        // Only finger 1 active -> the region reads finger 1's position.
+        let t = Thresholds::default();
+        let mut s = neutral();
+        s.touch[1] = touched(1800, 300); // right + upper
+        assert!(s.pressed(Control::TouchRight, &t));
+        assert!(s.pressed(Control::TouchUpper, &t));
+        assert!(!s.pressed(Control::TouchLeft, &t));
+        assert!(!s.pressed(Control::TouchMulti, &t));
     }
 
     #[test]

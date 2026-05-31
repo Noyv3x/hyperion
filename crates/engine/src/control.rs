@@ -24,11 +24,22 @@
 //! [`ControlMsg::SetAutoSwitchEnabled`]/[`ControlMsg::UpsertAutoSwitchRule`]/
 //! [`ControlMsg::DeleteAutoSwitchRule`] mutate `EngineConfig::auto_switch` (consumed by the
 //! `cfg(windows)` `ForegroundWatcher`, which sends [`ControlMsg::SetActiveProfile`] on a match).
+//!
+//! # Scope (M6)
+//! **M6** adds the touchpad + profile-import edits: [`ControlMsg::SetTouchpadSettings`] mutates a
+//! profile's `touchpad` (consumed by `apply`'s touch accumulator + the touch-region controls), and
+//! [`ControlMsg::ImportProfile`] stores a standalone profile TOML under a destination id (via
+//! [`hyperion_core::config::import_profile`]). The **two-stage / hip-fire trigger mode** is a field
+//! of [`TriggerSettings`](hyperion_core::trigger::TriggerSettings) (`mode`/`soft_threshold`/
+//! `hip_fire_us`), so it rides the existing [`ControlMsg::SetTriggerSettings`] arm with no new
+//! variant. **Export** is the GUI calling [`hyperion_core::config::export_profile`] on a snapshot
+//! profile directly (a pure read — no writer round-trip), so there is no `ExportProfile` message.
 
 use std::sync::Arc;
 
 use hyperion_core::config::{AutoSwitchRule, HidHideConfig, StickMode, ThreadConfig};
 use hyperion_core::input::Control;
+use hyperion_core::map::profile::TouchpadSettings;
 use hyperion_core::map::{
     BindTarget, GyroSettings, MacroDef, MouseSettings, ShiftTrigger, SpecialAction, TurboCfg,
 };
@@ -134,6 +145,18 @@ pub enum ControlMsg {
         /// Profile id to delete.
         name: String,
     },
+    /// Import a standalone profile from a TOML string (M6 profile import/export), storing it under
+    /// id `name`. The TOML is parsed with [`hyperion_core::config::import_profile`] (the same
+    /// defensive serde as the rest of the tree: missing keys default, unknown enum strings degrade);
+    /// a structurally invalid TOML is a silent no-op (the writer's no-change compare returns
+    /// `false`). The imported profile's `name` field is normalized to `name` so the on-disk key and
+    /// the profile name agree. Overwrites an existing profile with the same id.
+    ImportProfile {
+        /// Destination profile id (also written into the imported profile's `name`).
+        name: String,
+        /// The standalone profile TOML (as produced by `export_profile`).
+        toml: String,
+    },
     /// Assign `profile` to `device` (the persisted `device -> profile` map). Distinct from
     /// [`ControlMsg::SetActiveProfile`] only in intent; both mutate `EngineConfig::assignments`.
     SetAssignment {
@@ -218,6 +241,17 @@ pub enum ControlMsg {
         profile: String,
         /// The new mouse settings (validated/clamped by the writer).
         settings: MouseSettings,
+    },
+    /// Replace a profile's touchpad→mouse / touch-as-buttons settings (clamped on apply). **M6
+    /// consumer**: the resolved form feeds `apply`'s touch
+    /// [`MouseAccumulator`](hyperion_core::mouse_accum::MouseAccumulator) via `touch_step` when a
+    /// control is bound to `MouseMove(Touchpad)` and `as_mouse` is set, and gates the touch-region
+    /// controls (`TouchLeft/Right/Upper/Multi`) when `as_buttons` is set.
+    SetTouchpadSettings {
+        /// Profile id.
+        profile: String,
+        /// The new touchpad settings (validated/clamped by the writer).
+        settings: TouchpadSettings,
     },
 
     // ---- Macros / special actions (M4 consumers; §9) ----

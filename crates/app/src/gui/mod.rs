@@ -33,11 +33,15 @@ use eframe::egui;
 use engine::config::EngineConfig;
 use engine::handoff::TelemetryRx;
 use engine::telemetry::TelemetryFrame;
-use engine::{ControlMsg, Stick};
-use hyperion_core::config::{AutoSwitchConfig, AutoSwitchRule, HidHideConfig, ThreadConfig};
+use engine::{ControlMsg, Stick, Trigger};
+use hyperion_core::config::{
+    export_profile, AutoSwitchConfig, AutoSwitchRule, HidHideConfig, ThreadConfig,
+};
+use hyperion_core::map::profile::TouchpadSettings;
 use hyperion_core::map::{GyroSettings, MacroDef, MouseSettings, Profile};
 use hyperion_core::output::PadTarget;
 use hyperion_core::stick::settings::StickSettings;
+use hyperion_core::trigger::TriggerSettings;
 
 mod autoswitch;
 mod bindings;
@@ -48,7 +52,9 @@ mod panels;
 mod profiles;
 mod scope;
 mod sticks;
+mod touchpad;
 mod tray;
+mod triggers;
 
 use tray::TrayState;
 
@@ -80,16 +86,20 @@ const TRAIL_LEN: usize = 48;
 /// on the Profiles tab); Profiles / Auto-switch are structural; Gyro edits the active profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
-    /// Profile manager + device→profile assignment + per-profile output kind (M5).
+    /// Profile manager + device→profile assignment + per-profile output kind + import/export (M5/M6).
     Profiles,
     /// Per-control binding editor: bind any control to any [`BindTarget`] + shift + turbo.
     Mapping,
     /// Per-stick settings: RC sub-section + deadzone / sensitivity / curve.
     Sticks,
+    /// Per-trigger settings: two-stage / hip-fire mode + soft threshold + the analog chain (M6).
+    Triggers,
     /// Mouse-from-stick settings (sensitivity / deadzone / accel / invert).
     Mouse,
     /// Gyro→mouse settings: mode / sensitivity / deadzone / invert / vertical scale (M5).
     Gyro,
+    /// Touchpad→mouse + touch-as-buttons settings (M6).
+    Touchpad,
     /// Macro editor (add/edit/delete timed macro step lists).
     Macros,
     /// Foreground auto-profile-switch rule table (M5).
@@ -99,13 +109,16 @@ enum Tab {
 }
 
 impl Tab {
-    /// The tab strip, in display order.
-    const ALL: [Tab; 8] = [
+    /// The tab strip, in display order (RC/stick → trigger → mapping/mouse/gyro/touchpad →
+    /// macros → structural).
+    const ALL: [Tab; 10] = [
         Tab::Profiles,
         Tab::Mapping,
         Tab::Sticks,
+        Tab::Triggers,
         Tab::Mouse,
         Tab::Gyro,
+        Tab::Touchpad,
         Tab::Macros,
         Tab::AutoSwitch,
         Tab::Engine,
@@ -117,8 +130,10 @@ impl Tab {
             Tab::Profiles => "Profiles",
             Tab::Mapping => "Mapping",
             Tab::Sticks => "Sticks",
+            Tab::Triggers => "Triggers",
             Tab::Mouse => "Mouse",
             Tab::Gyro => "Gyro",
+            Tab::Touchpad => "Touchpad",
             Tab::Macros => "Macros",
             Tab::AutoSwitch => "Auto-switch",
             Tab::Engine => "Engine",
@@ -202,6 +217,11 @@ pub struct StructMirror {
     pub auto_switch_committed: Vec<AutoSwitchRule>,
     /// Transient: the "new profile" name buffer on the Profiles screen (never persisted).
     pub new_profile_name: String,
+    /// Transient: the import/export TOML text area on the Profiles screen (never persisted). The
+    /// Export button fills it from the active profile; the Import button parses it into a profile.
+    pub import_export_toml: String,
+    /// Transient: the destination id buffer for an Import (never persisted).
+    pub import_name: String,
 }
 
 impl StructMirror {
@@ -215,6 +235,8 @@ impl StructMirror {
             auto_switch: snapshot.auto_switch.clone(),
             auto_switch_committed: snapshot.auto_switch.rules.clone(),
             new_profile_name: String::new(),
+            import_export_toml: String::new(),
+            import_name: String::new(),
         }
     }
 
@@ -346,6 +368,20 @@ fn resolve_profile_id(snapshot: &EngineConfig, device: &str) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// A compact `name: value` field for the status header (weak label, strong monospace value).
+fn header_field(ui: &mut egui::Ui, name: &str, value: &str) {
+    ui.label(egui::RichText::new(format!("{name}:")).weak());
+    ui.label(egui::RichText::new(value).strong().monospace());
+}
+
+/// Display label for a [`PadTarget`] in the status header (short form).
+fn output_kind_label(kind: PadTarget) -> &'static str {
+    match kind {
+        PadTarget::X360 => "Xbox 360",
+        PadTarget::Ds4 => "DualShock 4",
+    }
+}
+
 /// Append a point to a fixed-length trail, dropping the oldest when full.
 fn push_trail(trail: &mut Vec<egui::Vec2>, x: f32, y: f32) {
     if trail.len() == TRAIL_LEN {
@@ -380,9 +416,29 @@ impl eframe::App for HyperionApp {
             ui.horizontal(|ui| {
                 ui.heading("Hyperion");
                 ui.separator();
-                ui.label(format!("device: {}", self.active_device));
+                header_field(ui, "device", &self.active_device);
                 ui.separator();
-                ui.label(format!("profile: {}", self.mirror.profile));
+                header_field(ui, "profile", &self.mirror.profile);
+                ui.separator();
+                let active_profile = self.mirror.profile.clone();
+                let output = output_kind_label(self.output_kind_for(&active_profile));
+                header_field(ui, "output", output);
+                ui.separator();
+                // Live timing from the triple-buffered telemetry frame: the guarded report
+                // interval, its rate, and the latest loop-busy (the honest p99 proxy — the hot
+                // loop owns the full reservoir; the frame carries the latest sample).
+                header_field(ui, "dt", &format!("{:.1} us", self.latest.dt_us));
+                let rate = if self.latest.dt_us > 0.0 {
+                    1_000_000.0 / self.latest.dt_us as f64
+                } else {
+                    0.0
+                };
+                header_field(ui, "rate", &format!("{rate:.0} Hz"));
+                header_field(
+                    ui,
+                    "loop",
+                    &format!("{:.1} us", self.latest.loop_busy_ns as f64 / 1000.0),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Save").clicked() {
                         self.send(ControlMsg::SaveToDisk);
@@ -421,8 +477,10 @@ impl eframe::App for HyperionApp {
                     ui.separator();
                     sticks::stick_panel(ui, self, Stick::Right);
                 }
+                Tab::Triggers => triggers::triggers_panel(ui, self),
                 Tab::Mouse => mouse::mouse_panel(ui, self),
                 Tab::Gyro => gyro::gyro_panel(ui, self),
+                Tab::Touchpad => touchpad::touchpad_panel(ui, self),
                 Tab::Macros => macros::macros_panel(ui, self),
                 Tab::AutoSwitch => autoswitch::autoswitch_panel(ui, self),
                 Tab::Engine => panels::global_panel(ui, self),
@@ -603,6 +661,31 @@ impl HyperionApp {
         &self.structure.new_profile_name
     }
 
+    /// Borrow the transient import/export TOML text-area buffer (Profiles screen).
+    pub(crate) fn import_export_toml_mut(&mut self) -> &mut String {
+        &mut self.structure.import_export_toml
+    }
+
+    /// Read the transient import/export TOML text-area buffer.
+    pub(crate) fn import_export_toml(&self) -> &str {
+        &self.structure.import_export_toml
+    }
+
+    /// Set the import/export TOML buffer (used by the Export button to dump the active profile).
+    pub(crate) fn set_import_export_toml(&mut self, toml: String) {
+        self.structure.import_export_toml = toml;
+    }
+
+    /// Borrow the transient import destination-id buffer (Profiles screen).
+    pub(crate) fn import_name_mut(&mut self) -> &mut String {
+        &mut self.structure.import_name
+    }
+
+    /// Read the transient import destination-id buffer.
+    pub(crate) fn import_name(&self) -> &str {
+        &self.structure.import_name
+    }
+
     // --- Profile lifecycle edits -------------------------------------------------------------
 
     /// Create a new all-passthrough profile `id` and send `CreateProfile`. No-op if it exists.
@@ -744,6 +827,103 @@ impl HyperionApp {
             profile: self.mirror.profile.clone(),
             settings,
         });
+    }
+
+    // --- Touchpad settings (active profile, M6) ----------------------------------------------
+
+    /// The active profile's touchpad settings (defaults to the inert default if the profile is
+    /// missing: touch-as-mouse off, touch-region buttons on).
+    pub(crate) fn touchpad_settings(&self) -> TouchpadSettings {
+        self.structure
+            .profiles
+            .get(&self.mirror.profile)
+            .map(|p| p.touchpad)
+            .unwrap_or_default()
+    }
+
+    /// Update the active profile's touchpad settings in the structural mirror (call before
+    /// [`push_touchpad_settings`](Self::push_touchpad_settings)).
+    pub(crate) fn set_touchpad_settings(&mut self, touchpad: TouchpadSettings) {
+        if let Some(p) = self.structure.profiles.get_mut(&self.mirror.profile) {
+            p.touchpad = touchpad;
+        }
+    }
+
+    /// Send the active profile's touchpad settings via `SetTouchpadSettings` (engine clamps on
+    /// apply).
+    pub(crate) fn push_touchpad_settings(&mut self) {
+        let settings = self.touchpad_settings();
+        self.send(ControlMsg::SetTouchpadSettings {
+            profile: self.mirror.profile.clone(),
+            settings,
+        });
+    }
+
+    // --- Trigger settings (active profile, M6 two-stage / hip-fire) --------------------------
+
+    /// The active profile's settings for `trigger` (defaults to the §4 clean state if the profile
+    /// is missing).
+    pub(crate) fn trigger_settings(&self, trigger: Trigger) -> TriggerSettings {
+        self.structure
+            .profiles
+            .get(&self.mirror.profile)
+            .map(|p| match trigger {
+                Trigger::Left => p.l2,
+                Trigger::Right => p.r2,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Update the active profile's settings for `trigger` in the structural mirror (call before
+    /// [`push_trigger_settings`](Self::push_trigger_settings)).
+    pub(crate) fn set_trigger_settings(&mut self, trigger: Trigger, settings: TriggerSettings) {
+        if let Some(p) = self.structure.profiles.get_mut(&self.mirror.profile) {
+            match trigger {
+                Trigger::Left => p.l2 = settings,
+                Trigger::Right => p.r2 = settings,
+            }
+        }
+    }
+
+    /// Send the active profile's settings for `trigger` via `SetTriggerSettings` (engine clamps on
+    /// apply). The two-stage / hip-fire fields ride this same message — no new variant.
+    pub(crate) fn push_trigger_settings(&mut self, trigger: Trigger) {
+        let settings = self.trigger_settings(trigger);
+        self.send(ControlMsg::SetTriggerSettings {
+            profile: self.mirror.profile.clone(),
+            trigger,
+            settings,
+        });
+    }
+
+    // --- Profile import / export (M6) --------------------------------------------------------
+
+    /// Export the active profile to a standalone TOML string via
+    /// [`hyperion_core::config::export_profile`]. A pure read of the structural mirror (no writer
+    /// round-trip); returns an empty string if the active profile is somehow absent.
+    pub(crate) fn export_active_profile(&self) -> String {
+        self.structure
+            .profiles
+            .get(&self.mirror.profile)
+            .map(export_profile)
+            .unwrap_or_default()
+    }
+
+    /// Import a standalone profile TOML under id `name`: optimistically parse it into the
+    /// structural mirror (so the profile list updates immediately) and send `ImportProfile` to the
+    /// engine's single writer. A TOML that fails to parse leaves the mirror untouched and is a
+    /// no-op on the engine side too.
+    pub(crate) fn import_profile_toml(&mut self, name: String, toml: String) {
+        if name.trim().is_empty() {
+            return;
+        }
+        let name = name.trim().to_string();
+        // Optimistic mirror update: only insert if the TOML parses (mirrors the engine arm).
+        if let Ok(mut p) = hyperion_core::config::import_profile(&toml) {
+            p.name = name.clone();
+            self.structure.profiles.insert(name.clone(), p);
+        }
+        self.send(ControlMsg::ImportProfile { name, toml });
     }
 
     // --- Auto-switch policy ------------------------------------------------------------------

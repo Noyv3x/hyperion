@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use hyperion_core::config::{load_toml, to_toml, AutoSwitchRule, EngineConfig};
+use hyperion_core::config::{import_profile, load_toml, to_toml, AutoSwitchRule, EngineConfig};
 use hyperion_core::map::{BindingSlot, Profile};
 
 use crate::control::{ControlMsg, Stick, Trigger};
@@ -275,6 +275,17 @@ fn edit_in_place(cfg: &mut EngineConfig, msg: &ControlMsg) {
                 cfg.assignments.retain(|_, pid| pid != name);
             }
         }
+        ControlMsg::ImportProfile { name, toml } => {
+            // Parse the standalone profile TOML (defensive serde — partial/stale loads, only
+            // structurally invalid TOML errors). On a parse error this is a silent no-op: the
+            // imported profile is dropped and the caller's no-change compare returns `false`.
+            if let Ok(mut imported) = import_profile(toml) {
+                // Normalize the profile name to the destination id so the map key and the stored
+                // name agree (the export carries the source profile's own name).
+                imported.name = name.clone();
+                Arc::make_mut(&mut cfg.profiles).insert(name.clone(), imported);
+            }
+        }
         ControlMsg::SetOutputKind { profile, kind } => {
             if let Some(p) = profile_mut(cfg, profile) {
                 p.output_kind = *kind;
@@ -352,6 +363,11 @@ fn edit_in_place(cfg: &mut EngineConfig, msg: &ControlMsg) {
         ControlMsg::SetMouseSettings { profile, settings } => {
             if let Some(p) = profile_mut(cfg, profile) {
                 p.mouse = *settings;
+            }
+        }
+        ControlMsg::SetTouchpadSettings { profile, settings } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                p.touchpad = *settings;
             }
         }
 
@@ -1104,5 +1120,150 @@ mod tests {
         assert!(!store.apply(&ControlMsg::SaveToDisk));
         assert!(!store.apply(&ControlMsg::ReloadFromDisk));
         assert_eq!(store.generation(), g0);
+    }
+
+    // ------------------------------------- M6: touchpad settings ---------------------------------
+
+    #[test]
+    fn apply_set_touchpad_settings_mutates_and_resolves_clamped() {
+        use hyperion_core::map::profile::TouchpadSettings;
+        let store = store_with_profile();
+        let settings = TouchpadSettings {
+            as_mouse: true,
+            sensitivity: 9_999.0, // above the 100 clamp
+            invert_y: true,
+            ..TouchpadSettings::default()
+        };
+        assert!(store.apply(&ControlMsg::SetTouchpadSettings {
+            profile: "default".to_string(),
+            settings,
+        }));
+        // The editable profile carries the typed value; the resolved (hot-facing) form is clamped.
+        let snap = store.snapshot();
+        assert!(snap.profiles["default"].touchpad.as_mouse);
+        assert!(snap.profiles["default"].touchpad.invert_y);
+        let resolved = snap.resolved["dev"].touchpad;
+        assert_eq!(
+            resolved.sensitivity, 100.0,
+            "resolved touchpad sensitivity clamped"
+        );
+        assert!(resolved.as_mouse && resolved.invert_y);
+    }
+
+    #[test]
+    fn apply_set_touchpad_settings_to_default_is_noop() {
+        // The default touchpad settings already match the profile default, so a redundant set is a
+        // no-op (no generation churn) — guards the touch path stays inert for an unconfigured profile.
+        use hyperion_core::map::profile::TouchpadSettings;
+        let store = store_with_profile();
+        let g0 = store.generation();
+        assert!(!store.apply(&ControlMsg::SetTouchpadSettings {
+            profile: "default".to_string(),
+            settings: TouchpadSettings::default(),
+        }));
+        assert_eq!(store.generation(), g0);
+    }
+
+    // ----------------------- M6: two-stage trigger rides SetTriggerSettings ----------------------
+
+    #[test]
+    fn apply_set_trigger_settings_carries_two_stage_mode() {
+        // The two-stage / hip-fire trigger mode is a field of TriggerSettings, so it flows through
+        // the existing SetTriggerSettings arm with no new ControlMsg variant (the M6 contract).
+        use hyperion_core::trigger::{TriggerMode, TriggerSettings};
+        let store = store_with_profile();
+        let settings = TriggerSettings {
+            mode: TriggerMode::TwoStage,
+            soft_threshold: 60,
+            ..TriggerSettings::default()
+        };
+        assert!(store.apply(&ControlMsg::SetTriggerSettings {
+            profile: "default".to_string(),
+            trigger: Trigger::Left,
+            settings,
+        }));
+        let snap = store.snapshot();
+        assert_eq!(snap.profiles["default"].l2.mode, TriggerMode::TwoStage);
+        assert_eq!(snap.profiles["default"].l2.soft_threshold, 60);
+        // The resolved (hot-facing) trigger carries the mode the staged `process_trigger` consumes.
+        assert_eq!(snap.resolved["dev"].l2.mode, TriggerMode::TwoStage);
+    }
+
+    // ------------------------------------- M6: profile import ------------------------------------
+
+    #[test]
+    fn apply_import_profile_round_trips_and_normalizes_name() {
+        use hyperion_core::config::export_profile;
+        use hyperion_core::map::profile::TouchpadSettings;
+        use hyperion_core::map::BindingSlot;
+        let store = store_with_profile();
+
+        // Build a source profile with a distinctive (touch) setting + a binding, then export it.
+        let mut src = Profile {
+            name: "shared".to_string(),
+            touchpad: TouchpadSettings {
+                as_mouse: true,
+                sensitivity: 60.0,
+                ..TouchpadSettings::default()
+            },
+            ..Profile::default()
+        };
+        src.bindings.insert(
+            Control::Cross,
+            BindingSlot::from_bind(BindTarget::GamepadButton(PadBtn::B)),
+        );
+        let toml = export_profile(&src);
+
+        // Import it under a NEW id; the stored profile must carry the source settings and have its
+        // name normalized to the destination id.
+        assert!(store.apply(&ControlMsg::ImportProfile {
+            name: "imported".to_string(),
+            toml,
+        }));
+        let snap = store.snapshot();
+        let p = &snap.profiles["imported"];
+        assert_eq!(p.name, "imported", "name normalized to the destination id");
+        assert!(p.touchpad.as_mouse);
+        assert_eq!(p.touchpad.sensitivity, 60.0);
+        assert_eq!(
+            p.bindings[&Control::Cross].bind,
+            BindTarget::GamepadButton(PadBtn::B)
+        );
+    }
+
+    #[test]
+    fn apply_import_profile_invalid_toml_is_noop() {
+        let store = store_with_profile();
+        let g0 = store.generation();
+        // Structurally invalid TOML cannot parse -> silent no-op (no panic, no generation bump).
+        assert!(!store.apply(&ControlMsg::ImportProfile {
+            name: "broken".to_string(),
+            toml: "this is = = not valid toml [[".to_string(),
+        }));
+        assert_eq!(store.generation(), g0);
+        assert!(!store.snapshot().profiles.contains_key("broken"));
+    }
+
+    #[test]
+    fn apply_import_profile_overwrites_existing_id() {
+        use hyperion_core::config::export_profile;
+        let store = store_with_profile();
+        // Import over the existing "default" id with an output-kind change so the compare differs.
+        let src = Profile {
+            name: "whatever".to_string(),
+            output_kind: hyperion_core::output::PadTarget::Ds4,
+            ..Profile::default()
+        };
+        assert!(store.apply(&ControlMsg::ImportProfile {
+            name: "default".to_string(),
+            toml: export_profile(&src),
+        }));
+        let snap = store.snapshot();
+        assert_eq!(
+            snap.profiles["default"].output_kind,
+            hyperion_core::output::PadTarget::Ds4,
+            "import overwrites the existing profile id"
+        );
+        assert_eq!(snap.profiles["default"].name, "default");
     }
 }

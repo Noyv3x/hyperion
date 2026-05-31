@@ -119,12 +119,16 @@ pub enum AxisDir {
     Pos,
 }
 
-/// Which raw source feeds a mouse-move binding (stick→mouse or gyro→mouse). M4/M5 consumer.
+/// Which raw source feeds a mouse-move binding (stick→mouse / gyro→mouse / touchpad→mouse).
+/// M4/M5/M6 consumer. **Append-only**: `Touchpad` was added in M6 before the `Unknown` fallback,
+/// so the serde tag order/names stay a stable persisted contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MouseMoveSrc {
     LeftStick,
     RightStick,
     Gyro,
+    /// Touchpad finger drag → relative mouse (M6).
+    Touchpad,
     /// Append-only fallback.
     #[serde(other)]
     Unknown,

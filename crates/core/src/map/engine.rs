@@ -74,7 +74,7 @@ use crate::map::binding::{
     AxisDir, BindTarget, BindingSlot, GamepadAxis, KeyKind, MouseMoveSrc, TurboCfg, WheelDir,
 };
 use crate::map::profile::ResolvedProfile;
-use crate::mouse_accum::{GyroAccumCfg, MouseAccumCfg};
+use crate::mouse_accum::{GyroAccumCfg, MouseAccumCfg, TouchAccumCfg};
 use crate::output::{KbmBatch, KbmEvent, KeyKind as InjectKind, MouseButton, OutputState};
 
 /// Re-export the real [`MouseAccumulator`](crate::mouse_accum::MouseAccumulator) so the historical
@@ -188,6 +188,12 @@ pub struct MapState {
     pub stick_mouse: MouseAccumulator,
     /// Gyro→mouse remainder carry (M5 consumer).
     pub gyro_mouse: MouseAccumulator,
+    /// Touchpad→mouse remainder carry (M6 consumer).
+    pub touch_mouse: MouseAccumulator,
+    /// The finger-0 [`TouchContact`](crate::input::TouchContact) from the previous report, the
+    /// delta anchor the touchpad→mouse accumulator differences against (M6 consumer). `Default`
+    /// (inactive) means "no previous contact", so the first touch report produces no jump.
+    pub prev_touch: crate::input::TouchContact,
     /// Mouse-wheel notch remainder (M4 consumer).
     pub wheel_remainder: f64,
     /// vk→toggle-latched-value (verifier FIX 6).
@@ -208,6 +214,8 @@ impl Default for MapState {
             prev_active: [false; Control::COUNT],
             stick_mouse: MouseAccumulator::new(),
             gyro_mouse: MouseAccumulator::new(),
+            touch_mouse: MouseAccumulator::new(),
+            prev_touch: crate::input::TouchContact::default(),
             wheel_remainder: 0.0,
             toggle: VkLatch::new(),
             pressed_once: VkLatch::new(),
@@ -360,8 +368,13 @@ struct MouseMoveCfg {
     stick: MouseAccumCfg,
     /// Gyro→mouse velocity-model tunables.
     gyro: GyroAccumCfg,
+    /// Touchpad→mouse tunables (M6).
+    touch: TouchAccumCfg,
     /// Read roll instead of yaw for the gyro horizontal axis.
     swap_yaw_roll: bool,
+    /// Whether touchpad→mouse is enabled (`TouchpadSettings::as_mouse`); when `false` a
+    /// `MouseMove(Touchpad)` binding is inert.
+    touch_as_mouse: bool,
 }
 
 /// Resolve a mouse-move binding: feed the resident [`MouseAccumulator`] from the named source's
@@ -404,6 +417,18 @@ fn resolve_mouse_move(
             let gz = -state.motion.gyro_pitch;
             ms.gyro_mouse
                 .gyro_velocity_step(gx, gz, elapsed_s, &cfg.gyro)
+        }
+        MouseMoveSrc::Touchpad => {
+            // Touchpad finger drag → relative mouse (M6). Inert unless `touchpad.as_mouse` is set.
+            // The delta is finger 0 between this report (`state.touch[0]`) and the previous
+            // (`ms.prev_touch`); `touch_step` resets on a finger lift / id change so a touch-down
+            // never jumps the cursor. `prev_touch` is advanced once per report by `apply`, not here.
+            if cfg.touch_as_mouse {
+                ms.touch_mouse
+                    .touch_step(ms.prev_touch, state.touch[0], &cfg.touch)
+            } else {
+                (0, 0)
+            }
         }
         MouseMoveSrc::Unknown => (0, 0),
     };
@@ -529,7 +554,9 @@ pub fn apply(
     let mmcfg = MouseMoveCfg {
         stick: mouse_cfg(rp),
         gyro: gyro_cfg(rp),
+        touch: rp.touchpad.to_accum_cfg(),
         swap_yaw_roll: rp.gyro.swap_yaw_roll,
+        touch_as_mouse: rp.touchpad.as_mouse,
     };
     // Gyro→mouse activation (M5): when `GyroMode::Off` (the default) the gyro feed is fully inert no
     // matter what is bound, so a non-gyro profile never produces gyro motion. The per-control `on`
@@ -620,6 +647,10 @@ pub fn apply(
         ms.prev_active[idx] = on;
     }
 
+    // Advance the touchpad delta anchor once per report (M6): the next `touch_step` differences the
+    // next contact against finger 0 of THIS report. Stored unconditionally so a `MouseMove(Touchpad)`
+    // binding always has a fresh anchor, and `touch_step`'s same-finger guard handles lifts/ids.
+    ms.prev_touch = state.touch[0];
     ms.prev_now_us = now_us;
     (out, batch)
 }
@@ -1148,6 +1179,8 @@ mod tests {
         assert_eq!(ms.prev_now_us, 0);
         assert_eq!(ms.stick_mouse.remainder(), (0.0, 0.0));
         assert_eq!(ms.gyro_mouse.remainder(), (0.0, 0.0));
+        assert_eq!(ms.touch_mouse.remainder(), (0.0, 0.0));
+        assert_eq!(ms.prev_touch, crate::input::TouchContact::default());
     }
 
     // ----------------------------- M4: shift / turbo / macro / mouse -----------------------------
@@ -1772,6 +1805,141 @@ mod tests {
             t += 5_000;
         }
         assert!(saw, "swapped horizontal axis reads roll");
+    }
+
+    // ------------------------------------ M6: touchpad→mouse -------------------------------------
+
+    use crate::input::TouchContact;
+    use crate::map::profile::TouchpadSettings;
+
+    fn active_contact(id: u8, x: u16, y: u16) -> TouchContact {
+        TouchContact {
+            is_active: true,
+            id,
+            x,
+            y,
+        }
+    }
+
+    /// Build a profile binding Cross to `MouseMove(Touchpad)` with the given touchpad settings.
+    fn rp_touch(touchpad: TouchpadSettings) -> ResolvedProfile {
+        let mut p = Profile {
+            touchpad,
+            ..Profile::default()
+        };
+        p.bindings.insert(
+            Control::Cross,
+            BindingSlot::from_bind(BindTarget::MouseMove(MouseMoveSrc::Touchpad)),
+        );
+        p.resolve()
+    }
+
+    fn touch_state(c: TouchContact) -> ControllerState {
+        ControllerState {
+            cross: true, // hold Cross so the bound MouseMove(Touchpad) feed runs
+            touch: [c, TouchContact::default()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn touchpad_as_mouse_off_is_inert() {
+        // Default touchpad settings have as_mouse == false: even a finger drag emits no MouseMove.
+        let rp = rp_touch(TouchpadSettings::default());
+        let mut ms = MapState::default();
+        let _ = apply(
+            &touch_state(active_contact(1, 100, 100)),
+            &rp,
+            &mut ms,
+            1_000,
+        );
+        let (_, b) = apply(
+            &touch_state(active_contact(1, 400, 100)),
+            &rp,
+            &mut ms,
+            6_000,
+        );
+        assert!(
+            b.as_slice()
+                .iter()
+                .all(|e| !matches!(e, KbmEvent::MouseMove { .. })),
+            "as_mouse off must emit no touch mouse motion"
+        );
+    }
+
+    #[test]
+    fn touchpad_as_mouse_drag_moves_cursor() {
+        // as_mouse on + a same-finger rightward drag -> a positive dx MouseMove. `sensitivity` is
+        // the resolved coefficient (DS4Windows `getTouchSensitivity·0.01`), so 1.0 with a 100-unit
+        // grid delta is ~100px — well past one pixel.
+        let rp = rp_touch(TouchpadSettings {
+            as_mouse: true,
+            sensitivity: 1.0,
+            jitter_comp: false,
+            ..TouchpadSettings::default()
+        });
+        let mut ms = MapState::default();
+        // First report establishes prev_touch (no prior contact -> no jump).
+        let _ = apply(
+            &touch_state(active_contact(1, 100, 200)),
+            &rp,
+            &mut ms,
+            1_000,
+        );
+        let (_, b) = apply(
+            &touch_state(active_contact(1, 200, 200)),
+            &rp,
+            &mut ms,
+            6_000,
+        );
+        let mut saw = false;
+        for e in b.as_slice() {
+            if let KbmEvent::MouseMove { dx, dy } = e {
+                assert!(*dx > 0, "rightward drag -> dx>0, got {dx}");
+                assert_eq!(*dy, 0, "pure-x drag -> no vertical, got {dy}");
+                saw = true;
+            }
+        }
+        assert!(saw, "a same-finger drag emits a MouseMove");
+    }
+
+    #[test]
+    fn touchpad_touchdown_does_not_jump() {
+        // A fresh touch-down (prev inactive) must NOT emit a jump from the origin.
+        let rp = rp_touch(TouchpadSettings {
+            as_mouse: true,
+            sensitivity: 100.0,
+            ..TouchpadSettings::default()
+        });
+        let mut ms = MapState::default();
+        // prev_touch defaults to inactive; first contact at (900,500) must not produce motion.
+        let (_, b) = apply(
+            &touch_state(active_contact(1, 900, 500)),
+            &rp,
+            &mut ms,
+            1_000,
+        );
+        assert!(
+            b.as_slice()
+                .iter()
+                .all(|e| !matches!(e, KbmEvent::MouseMove { .. })),
+            "touch-down (no prev contact) must not jump the cursor"
+        );
+    }
+
+    #[test]
+    fn default_profile_touch_emits_nothing_passthrough_unchanged() {
+        // A fully default profile with an active touch contact is byte-identical passthrough.
+        let rp = ResolvedProfile::default();
+        let mut ms = MapState::default();
+        let st = ControllerState {
+            touch: [active_contact(1, 1800, 800), TouchContact::default()],
+            lx: 0.3,
+            ..Default::default()
+        };
+        let (out, b) = apply(&st, &rp, &mut ms, 1_000);
+        assert_eq!(out, OutputState::passthrough(&st));
+        assert!(b.is_empty(), "no touch binding -> no KBM events");
     }
 
     #[test]

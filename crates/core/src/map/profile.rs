@@ -16,8 +16,8 @@ use std::sync::Arc;
 use crate::input::{Control, Thresholds};
 use crate::map::binding::BindingSlot;
 use crate::mouse_accum::{
-    GyroAccumCfg, MouseAccumCfg, GYRO_MOUSE_DEADZONE_DEFAULT, GYRO_MOUSE_OFFSET_DEFAULT,
-    MOUSE_VELOCITY_OFFSET_DEFAULT,
+    GyroAccumCfg, MouseAccumCfg, TouchAccumCfg, GYRO_MOUSE_DEADZONE_DEFAULT,
+    GYRO_MOUSE_OFFSET_DEFAULT, MOUSE_VELOCITY_OFFSET_DEFAULT, TOUCH_MOUSE_OFFSET_DEFAULT,
 };
 use crate::output::{MouseButton, PadTarget};
 use crate::stick::settings::StickSettings;
@@ -52,6 +52,9 @@ pub struct Profile {
     /// Gyro→mouse settings. **M5 consumer** ([`GyroSettings::to_accum_cfg`]).
     #[serde(default)]
     pub gyro: GyroSettings,
+    /// Touchpad→mouse / as-buttons settings. **M6 consumer** ([`TouchpadSettings::to_accum_cfg`]).
+    #[serde(default)]
+    pub touchpad: TouchpadSettings,
     /// Macro definitions referenced by `BindTarget::Macro(id)`. **M4 consumer** (the injector
     /// thread plays them on a `Macro{start}` edge).
     #[serde(default)]
@@ -302,6 +305,106 @@ impl GyroSettings {
     }
 }
 
+/// Touchpad→mouse / touch-as-buttons settings (blueprint §12 M6; ground truth
+/// `Hyperion-ds4w/.../MouseCursor.cs::TouchMoveCursor` + `DS4Device.cs` touch-region split).
+///
+/// The editable, persisted form; [`TouchpadSettings::clamped`] enforces the ranges and
+/// [`TouchpadSettings::to_accum_cfg`] projects the relative-mouse tunables into the hot-facing
+/// [`TouchAccumCfg`](crate::mouse_accum::TouchAccumCfg) that [`apply`](crate::map::apply) feeds the
+/// touch [`MouseAccumulator`](crate::mouse_accum::MouseAccumulator) via `touch_step` when a control
+/// is bound to `MouseMove(MouseMoveSrc::Touchpad)`.
+///
+/// * `as_mouse` — master enable for touchpad→relative-mouse. When `false` (the default) a
+///   `MouseMove(Touchpad)` binding is inert (no touch motion), so an unconfigured profile is
+///   byte-identical to M5.
+/// * `as_buttons` — enable the touch finger-region controls (`TouchLeft/Right/Upper/Multi`). When
+///   `false` those controls always read released even on a contact; the controls themselves are
+///   always decoded into [`ControllerState`](crate::input::ControllerState), this flag only gates
+///   whether the engine treats them as live. (The hot path reads this on the resolved profile.)
+/// * `sensitivity` — `getTouchSensitivity·0.01` master coefficient.
+/// * `velocity_offset` — `TOUCHPAD_MOUSE_OFFSET` direction-split anti-jitter offset.
+/// * `min_threshold` — per-report motion gate (`1.0` == always-carry special case).
+/// * `jitter_comp` — enable the `^1.408` ease below the touch jitter threshold.
+/// * `invert_x` / `invert_y` — negate the final delta per axis.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct TouchpadSettings {
+    /// Master enable for touchpad→relative-mouse (default `false` => inert).
+    pub as_mouse: bool,
+    /// Enable the touch finger-region controls (`TouchLeft/Right/Upper/Multi`).
+    pub as_buttons: bool,
+    /// Master touch→mouse coefficient (`getTouchSensitivity·0.01`).
+    pub sensitivity: f64,
+    /// Direction-split anti-jitter offset (`TOUCHPAD_MOUSE_OFFSET`).
+    pub velocity_offset: f64,
+    /// Per-report motion gate (`1.0` == always-carry special case).
+    pub min_threshold: f64,
+    /// Enable the `^1.408` jitter-compensation ease curve.
+    pub jitter_comp: bool,
+    /// Invert the horizontal (X) output.
+    pub invert_x: bool,
+    /// Invert the vertical (Y) output.
+    pub invert_y: bool,
+}
+
+impl Default for TouchpadSettings {
+    /// Inert defaults: touch→mouse `as_mouse = false`, finger-region controls `as_buttons = true`
+    /// (decoded but only meaningful when a touch-region control is bound), DS4Windows-class
+    /// relative-mouse tunables for when it is enabled. An unconfigured profile therefore produces
+    /// no touch mouse motion, so adding these fields is non-breaking.
+    fn default() -> Self {
+        Self {
+            as_mouse: false,
+            as_buttons: true,
+            sensitivity: 1.0,
+            velocity_offset: TOUCH_MOUSE_OFFSET_DEFAULT,
+            min_threshold: 1.0,
+            jitter_comp: true,
+            invert_x: false,
+            invert_y: false,
+        }
+    }
+}
+
+impl TouchpadSettings {
+    /// Clamp every field into its valid range (called off the hot path, in `resolve()`). Non-finite
+    /// inputs collapse to the default before clamping; the bool flags pass through; `min_threshold`
+    /// floors at the always-carry `1.0`.
+    #[inline]
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        let d = Self::default();
+        let fin = |v: f64, fallback: f64| if v.is_finite() { v } else { fallback };
+        Self {
+            as_mouse: self.as_mouse,
+            as_buttons: self.as_buttons,
+            sensitivity: fin(self.sensitivity, d.sensitivity).clamp(0.01, 100.0),
+            velocity_offset: fin(self.velocity_offset, d.velocity_offset).clamp(0.0, 10.0),
+            min_threshold: fin(self.min_threshold, d.min_threshold).max(1.0),
+            jitter_comp: self.jitter_comp,
+            invert_x: self.invert_x,
+            invert_y: self.invert_y,
+        }
+    }
+
+    /// Project into the hot-facing [`TouchAccumCfg`] the engine feeds `touch_step`. Call after
+    /// `clamped()` has run in `resolve()`. The `as_mouse`/`as_buttons` gates are NOT part of the
+    /// accumulator config (the engine reads them to gate the feed / the region controls); only the
+    /// relative-mouse tunables flow into [`TouchAccumCfg`].
+    #[inline]
+    #[must_use]
+    pub fn to_accum_cfg(self) -> TouchAccumCfg {
+        TouchAccumCfg {
+            sensitivity: self.sensitivity,
+            velocity_offset: self.velocity_offset,
+            min_threshold: self.min_threshold,
+            jitter_comp: self.jitter_comp,
+            invert_x: self.invert_x,
+            invert_y: self.invert_y,
+        }
+    }
+}
+
 /// One mouse-button selector inside a [`MacroStep`] (kept separate from [`MouseButton`] only so the
 /// serde form is explicit/append-only). Maps 1:1 to [`MouseButton`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -425,6 +528,9 @@ impl Profile {
             // M5: clamped gyro→mouse settings (consumed by `apply()` via `to_accum_cfg` when
             // `gyro.mode` is active).
             gyro: self.gyro.clamped(),
+            // M6: clamped touchpad→mouse / as-buttons settings (consumed by `apply()` when a
+            // `MouseMove(Touchpad)` binding is active and `touchpad.as_mouse` is set).
+            touchpad: self.touchpad.clamped(),
             macros: Arc::from(self.macros.clone()),
         }
     }
@@ -471,6 +577,11 @@ pub struct ResolvedProfile {
     /// [`to_accum_cfg`](GyroSettings::to_accum_cfg) to feed the gyro accumulator when
     /// [`GyroSettings::mode`] is active. `Copy`, read inline on the hot path.
     pub gyro: GyroSettings,
+    /// Resolved (clamped) touchpad→mouse / as-buttons settings (M6); `apply()` calls
+    /// [`to_accum_cfg`](TouchpadSettings::to_accum_cfg) to feed the touch accumulator when a
+    /// `MouseMove(Touchpad)` binding is active and [`TouchpadSettings::as_mouse`] is set. `Copy`,
+    /// read inline on the hot path.
+    pub touchpad: TouchpadSettings,
     /// The profile's macro table, Arc-shared so a generation rebuild is a refcount bump (the hot
     /// path never reads this; the injector thread plays a macro on a `Macro{start}` edge).
     pub macros: Arc<[MacroDef]>,
@@ -489,6 +600,7 @@ impl Default for ResolvedProfile {
             output_kind: PadTarget::default(),
             mouse: MouseSettings::default(),
             gyro: GyroSettings::default(),
+            touchpad: TouchpadSettings::default(),
             macros: Arc::from(Vec::new()),
         }
     }
@@ -820,5 +932,85 @@ mod tests {
         let back: Wrap = toml::from_str("mode = \"SomeFutureMode\"\n").unwrap();
         assert_eq!(back.mode, GyroMode::Unknown);
         assert!(!back.mode.is_active(true));
+    }
+
+    // ------------------------------------ M6 touchpad settings -----------------------------------
+
+    #[test]
+    fn touchpad_settings_default_is_inert_off() {
+        // Default: as_mouse off (no touch motion for an unconfigured profile), as_buttons on.
+        let t = TouchpadSettings::default();
+        assert!(!t.as_mouse, "touch-as-mouse off by default");
+        assert!(t.as_buttons);
+        assert_eq!(t.to_accum_cfg(), TouchAccumCfg::default());
+    }
+
+    #[test]
+    fn touchpad_settings_clamp_bounds_and_non_finite() {
+        let wild = TouchpadSettings {
+            as_mouse: true,
+            as_buttons: false,
+            sensitivity: 9_999.0,
+            velocity_offset: 999.0, // above 10
+            min_threshold: 0.0,     // below the 1.0 floor
+            jitter_comp: false,
+            invert_x: true,
+            invert_y: true,
+        };
+        let c = wild.clamped();
+        assert!(c.as_mouse && !c.as_buttons, "flags pass through clamp");
+        assert_eq!(c.sensitivity, 100.0);
+        assert_eq!(c.velocity_offset, 10.0);
+        assert_eq!(
+            c.min_threshold, 1.0,
+            "min_threshold floors at always-carry 1.0"
+        );
+        assert!(!c.jitter_comp && c.invert_x && c.invert_y);
+
+        // Non-finite collapses to default before clamping.
+        let nan = TouchpadSettings {
+            sensitivity: f64::NAN,
+            min_threshold: f64::INFINITY,
+            ..TouchpadSettings::default()
+        }
+        .clamped();
+        assert_eq!(nan.sensitivity, TouchpadSettings::default().sensitivity);
+        assert!(nan.min_threshold.is_finite());
+    }
+
+    #[test]
+    fn resolve_clamps_touchpad_and_default_is_off() {
+        let p = Profile {
+            touchpad: TouchpadSettings {
+                as_mouse: true,
+                sensitivity: -3.0, // clamps up to the 0.01 floor
+                ..TouchpadSettings::default()
+            },
+            ..Profile::default()
+        };
+        let rp = p.resolve();
+        assert!(rp.touchpad.as_mouse);
+        assert_eq!(
+            rp.touchpad.sensitivity, 0.01,
+            "resolve clamps touchpad settings"
+        );
+        assert!(!ResolvedProfile::default().touchpad.as_mouse);
+    }
+
+    #[test]
+    fn profile_with_touchpad_round_trips() {
+        let p = Profile {
+            name: "touch-test".to_string(),
+            touchpad: TouchpadSettings {
+                as_mouse: true,
+                sensitivity: 60.0,
+                invert_y: true,
+                ..TouchpadSettings::default()
+            },
+            ..Default::default()
+        };
+        let toml = toml::to_string(&p).unwrap();
+        let back: Profile = toml::from_str(&toml).unwrap();
+        assert_eq!(back, p);
     }
 }

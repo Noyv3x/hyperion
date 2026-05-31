@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use hyperion_core::config::EngineConfig;
 use hyperion_core::dt::Dt;
-use hyperion_core::input::{Control, ControllerState};
+use hyperion_core::input::{Control, ControllerState, TouchContact};
 use hyperion_core::map::{apply, BindTarget, MapState, ResolvedProfile};
 use hyperion_core::output::OutputState;
 use hyperion_core::stick::settings::{StickSettings, StickState};
@@ -45,6 +45,34 @@ use crate::clock::DtTracker;
 use crate::control::{forward_specials, ControlPlaneEvent, ControlPlaneTx};
 use crate::handoff::{CommandRx, ConfigHandle, HotCommand, KbmTx, TelemetryTx};
 use crate::telemetry::{LatencyReservoir, TelemetryFrame};
+
+/// The DualSense Edge / DualSense extended button superset carried on a [`HotInput`] (M6).
+///
+/// These mirror the capability-gated [`ControllerState`] fields (`mute`/`capture`/`fn_l`/`fn_r`/
+/// `blp`/`brp`/`side_l`/`side_r`) the core decode fills only when `meta.is_edge` is set
+/// (blueprint §3.5). Carrying them as one small `Copy` bundle keeps [`HotInput`] flat and lets
+/// `controller_state_from` fan them out into the structured state the mapping engine reads. The
+/// `Default` (all `false`) is the inert non-Edge behavior, so an unconfigured / non-Edge source is
+/// byte-identical to M5.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdgeButtons {
+    /// Mute button (DualSense / Edge).
+    pub mute: bool,
+    /// Capture / Create-adjacent capture button.
+    pub capture: bool,
+    /// Edge left function button.
+    pub fn_l: bool,
+    /// Edge right function button.
+    pub fn_r: bool,
+    /// Edge back-left paddle.
+    pub blp: bool,
+    /// Edge back-right paddle.
+    pub brp: bool,
+    /// Edge left side button.
+    pub side_l: bool,
+    /// Edge right side button.
+    pub side_r: bool,
+}
 
 /// One decoded input report, in the canonical units the pipeline consumes. The `hid-input`
 /// backend decodes the raw HID buffer (via `core`'s parser) into this; the engine never touches
@@ -63,6 +91,19 @@ pub struct HotInput {
     /// [`ControllerState`] decode the mapping engine reads. Zero new decode — the backend packs
     /// the same three bytes it already produced for `buttons`.
     pub raw_buttons: u32,
+    /// The two decoded touchpad finger contacts (M6, blueprint §3.2/§3.5). The backend decodes
+    /// these from the report tail (`core::input::ds_report::decode_controller_state` /
+    /// `parse_controller_state`); `controller_state_from` plugs them straight into the
+    /// [`ControllerState`] the mapping engine reads, so `apply()`'s touchpad→mouse accumulator and
+    /// the `TouchLeft/Right/Upper/Multi` region controls see live contacts. `Default` (both
+    /// inactive) is the inert M5 behavior — a source that does not surface touch (or a non-touch
+    /// report) leaves an untouched pad, so an unconfigured profile is byte-identical to M5.
+    pub touch: [TouchContact; 2],
+    /// The DualSense Edge / DualSense extended button superset (M6, gated by the source's
+    /// `meta.is_edge`): Mute, Capture, the two Fn buttons, the back-left/right paddles, and the two
+    /// side buttons. Decoded by the backend only when the source advertises the Edge report; a
+    /// non-Edge source leaves these `false`, so the decode is purely additive over M5.
+    pub edge: EdgeButtons,
     /// Guarded real elapsed time since the previous report (microseconds).
     pub dt_us: f64,
     /// `true` for the first report after enable/reset (pipeline primes, no step).
@@ -85,6 +126,8 @@ impl Default for HotInput {
             rt: 0.0,
             buttons: 0,
             raw_buttons: 0,
+            touch: [TouchContact::default(); 2],
+            edge: EdgeButtons::default(),
             dt_us: 0.0,
             is_prime: true,
             dropped: 0,
@@ -581,6 +624,11 @@ fn flick_to_px(flick_delta_rad: f64, cfg: &hyperion_core::stick::settings::Flick
 /// analog) so `L2FullPull`/`R2FullPull` digitize against the real `== 255`. The button bools are
 /// decoded from the raw DS button word with the same btn0/btn1/btn2 layout as
 /// `core::output::pack_xinput` / the former `win_io::ds_buttons_to_xinput` (single source of truth).
+///
+/// **M6.** The two touchpad finger contacts (`input.touch`) and the Edge button superset
+/// (`input.edge`) are carried straight from the backend decode into the structured state, so the
+/// engine's touchpad→mouse / touch-region / Edge-button paths are live. Both default inert, so a
+/// non-touch / non-Edge source is byte-identical to M5.
 #[inline]
 fn controller_state_from(
     input: &HotInput,
@@ -639,8 +687,22 @@ fn controller_state_from(
         // PS / Touchpad click (btn2).
         ps: btn2 & 0x01 != 0,
         touch_button: btn2 & 0x02 != 0,
-        // Edge / touch / motion fields are not decoded into the engine's HotInput yet (capability-
-        // gated in core; M5/M6). They read their `Default` (`false`/`0`).
+        // Touchpad finger contacts + Edge superset (M6): plug the backend-decoded values straight
+        // through so `apply()`'s touchpad→mouse accumulator and the `TouchLeft/Right/Upper/Multi`
+        // region controls see live contacts, and the Edge `Fn/paddle/Mute/Capture/side` controls
+        // resolve. Both default inert (untouched pad / all-`false`), so a non-touch / non-Edge
+        // source — or a backend that does not yet surface them — is byte-identical to M5.
+        touch: input.touch,
+        mute: input.edge.mute,
+        capture: input.edge.capture,
+        fn_l: input.edge.fn_l,
+        fn_r: input.edge.fn_r,
+        blp: input.edge.blp,
+        brp: input.edge.brp,
+        side_l: input.edge.side_l,
+        side_r: input.edge.side_r,
+        // Motion (gyro/accel) is not decoded into the engine's HotInput yet (M5 carries it via the
+        // gyro path elsewhere); it reads its `Default` (`0`).
         ..ControllerState::default()
     }
 }
@@ -803,6 +865,66 @@ mod tests {
         let st =
             controller_state_from(&input, StickSample::NEUTRAL, StickSample::NEUTRAL, 0.0, 0.0);
         assert!(st.dpad_right && !st.dpad_up && !st.dpad_down && !st.dpad_left);
+    }
+
+    #[test]
+    fn controller_state_carries_touch_contacts_and_edge_buttons() {
+        // M6: the backend-decoded touch contacts + Edge superset flow straight into the structured
+        // ControllerState the mapping engine reads (so apply()'s touch path + region controls see
+        // live contacts and the Edge buttons resolve). `TouchContact` is already in scope via
+        // `super::*`; only `Thresholds` needs importing for the region-control digitize.
+        use hyperion_core::input::Thresholds;
+        let input = HotInput {
+            touch: [
+                TouchContact {
+                    is_active: true,
+                    id: 3,
+                    x: 200,
+                    y: 100,
+                },
+                TouchContact::default(),
+            ],
+            edge: EdgeButtons {
+                mute: true,
+                fn_l: true,
+                brp: true,
+                ..EdgeButtons::default()
+            },
+            ..HotInput::default()
+        };
+        let st =
+            controller_state_from(&input, StickSample::NEUTRAL, StickSample::NEUTRAL, 0.0, 0.0);
+        // Touch contact carried verbatim.
+        assert!(st.touch[0].is_active && st.touch[0].id == 3 && st.touch[0].x == 200);
+        assert!(!st.touch[1].is_active);
+        // The left/upper region control reads the live contact (x<768 -> left, y<471 -> upper).
+        let t = Thresholds::default();
+        assert!(st.pressed(Control::TouchLeft, &t));
+        assert!(st.pressed(Control::TouchUpper, &t));
+        assert!(!st.pressed(Control::TouchRight, &t));
+        // Edge buttons resolve to their decoded flags.
+        assert!(st.mute && st.fn_l && st.brp);
+        assert!(!st.capture && !st.fn_r && !st.blp && !st.side_l && !st.side_r);
+    }
+
+    #[test]
+    fn controller_state_default_input_is_inert_touch_and_edge() {
+        // A non-touch / non-Edge report (the HotInput default) leaves an untouched pad and all Edge
+        // buttons false — byte-identical to the M5 inert behavior.
+        let st = controller_state_from(
+            &HotInput::default(),
+            StickSample::NEUTRAL,
+            StickSample::NEUTRAL,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            st.touch,
+            [hyperion_core::input::TouchContact::default(); 2],
+            "default input -> untouched pad"
+        );
+        assert!(!st.mute && !st.capture && !st.fn_l && !st.fn_r);
+        assert!(!st.blp && !st.brp && !st.side_l && !st.side_r);
     }
 
     #[test]

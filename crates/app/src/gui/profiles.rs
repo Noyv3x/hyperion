@@ -32,6 +32,77 @@ pub fn profiles_panel(ui: &mut egui::Ui, app: &mut HyperionApp) {
     ui.add_space(8.0);
     ui.separator();
     assignments_ui(ui, app);
+    ui.add_space(8.0);
+    ui.separator();
+    import_export_ui(ui, app);
+}
+
+/// The profile import/export section (M6): an Export button dumps the active profile to a TOML
+/// text area via `core::config::export_profile`; an Import button parses the text area into a new
+/// profile under a chosen id (`ControlMsg::ImportProfile`). A plain text area keeps the dependency
+/// surface tiny — no file dialog crate; the user pastes/copies the TOML (or saves the whole config
+/// via the header's Save button).
+fn import_export_ui(ui: &mut egui::Ui, app: &mut HyperionApp) {
+    ui.heading("Import / export");
+    ui.label(
+        egui::RichText::new(
+            "Export copies the active profile to the box below as shareable TOML. To import, \
+             paste a profile's TOML, set a destination id, and click Import.",
+        )
+        .weak()
+        .italics(),
+    );
+
+    let active = app.active_profile().to_string();
+    ui.horizontal(|ui| {
+        if ui.button("⬆ Export active").clicked() {
+            let toml = app.export_active_profile();
+            app.set_import_export_toml(toml);
+            // Default the import id to a non-colliding "<active> copy" so a round-trip import does
+            // not clobber the source.
+            if app.import_name().trim().is_empty() {
+                *app.import_name_mut() = format!("{active} copy");
+            }
+        }
+        ui.label(format!("(active profile: {active})"));
+    });
+
+    ui.add_space(4.0);
+    ui.add(
+        egui::TextEdit::multiline(app.import_export_toml_mut())
+            .desired_rows(10)
+            .desired_width(f32::INFINITY)
+            .code_editor()
+            .hint_text("# paste a profile's TOML here to import, or click Export to fill it"),
+    );
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("Import as id:");
+        ui.add(
+            egui::TextEdit::singleline(app.import_name_mut())
+                .hint_text("destination profile id")
+                .desired_width(180.0),
+        );
+        let can_import =
+            !app.import_name().trim().is_empty() && !app.import_export_toml().trim().is_empty();
+        if ui
+            .add_enabled(can_import, egui::Button::new("⬇ Import"))
+            .clicked()
+        {
+            let name = app.import_name().trim().to_string();
+            let toml = app.import_export_toml().to_string();
+            app.import_profile_toml(name, toml);
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "Import overwrites a profile with the same id. Partial / slightly-stale TOML still \
+             loads (missing keys take defaults); only structurally invalid TOML is ignored.",
+        )
+        .weak()
+        .italics(),
+    );
 }
 
 /// The profile list: a selectable row per profile (active = the GUI's edit target) with a rename

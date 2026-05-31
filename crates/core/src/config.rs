@@ -480,6 +480,27 @@ pub fn to_toml(c: &EngineConfig) -> String {
     toml::to_string_pretty(c).unwrap_or_default()
 }
 
+/// Export a single [`Profile`] to a standalone TOML string (M6 profile import/export).
+///
+/// The GUI uses this to write a shareable, one-profile `.toml` (distinct from the whole
+/// [`EngineConfig`] tree): the result round-trips through [`import_profile`]. Serialization of a
+/// `Profile` is total for this tree, so on the impossible serializer error it returns an empty
+/// string rather than panicking on the config path.
+pub fn export_profile(p: &Profile) -> String {
+    toml::to_string_pretty(p).unwrap_or_default()
+}
+
+/// Import a single [`Profile`] from a standalone TOML string (M6 profile import/export).
+///
+/// Inverse of [`export_profile`]. The same defensive serde shape as the rest of the tree applies:
+/// missing keys take their [`Default`] value and unknown enum strings fall back to the safe variant,
+/// so a partial or slightly-stale profile TOML still loads; only structurally invalid TOML errors.
+/// The returned profile is NOT yet clamped — call [`Profile::resolve`] (or fold it into an
+/// [`EngineConfig`] and call [`EngineConfig::clamped`]) before using it on the hot path.
+pub fn import_profile(s: &str) -> Result<Profile, toml::de::Error> {
+    toml::from_str(s)
+}
+
 impl EngineConfig {
     /// The shipped starter configuration: one `"default"` profile, a `dse_primary` device, and the
     /// `dse_primary -> "default"` assignment, so the shipped `config.toml` concept works out of the
@@ -779,6 +800,72 @@ dse_primary = "custom"
             .expect("resolved present");
         assert_eq!(rp.ls.dead_zone.dead_zone, 127, "dead_zone clamped to 127");
         assert_eq!(rp.ls.sensitivity, 2.0, "sensitivity preserved");
+    }
+
+    #[test]
+    fn export_import_profile_round_trips() {
+        use crate::map::profile::{GyroMode, GyroSettings, TouchpadSettings};
+        use crate::trigger::TriggerMode;
+
+        // A non-trivial profile exercising the M6 surfaces (touch-as-mouse, two-stage trigger,
+        // a touchpad-region binding) must survive export -> import unchanged.
+        let mut p = Profile {
+            name: "shareable".to_string(),
+            output_kind: PadTarget::X360,
+            touchpad: TouchpadSettings {
+                as_mouse: true,
+                sensitivity: 55.0,
+                invert_y: true,
+                ..TouchpadSettings::default()
+            },
+            gyro: GyroSettings {
+                mode: GyroMode::TriggerHeld,
+                ..GyroSettings::default()
+            },
+            ..Default::default()
+        };
+        p.l2.mode = TriggerMode::HipFire;
+        p.l2.soft_threshold = 60;
+        p.bindings.insert(
+            crate::input::Control::TouchLeft,
+            BindingSlot::from_bind(BindTarget::GamepadButton(PadBtn::Lb)),
+        );
+        p.bindings.insert(
+            crate::input::Control::Cross,
+            BindingSlot::from_bind(BindTarget::MouseMove(
+                crate::map::binding::MouseMoveSrc::Touchpad,
+            )),
+        );
+
+        let text = export_profile(&p);
+        let back = import_profile(&text).expect("exported profile must import");
+        assert_eq!(back, p, "profile must round-trip through export/import");
+    }
+
+    #[test]
+    fn import_profile_tolerates_partial_and_unknown() {
+        // Missing keys default; an unknown enum string degrades, not errors (defensive serde).
+        let p = import_profile("name = \"min\"\n").expect("partial profile must load");
+        assert_eq!(p.name, "min");
+        assert_eq!(p.touchpad, crate::map::profile::TouchpadSettings::default());
+
+        // An unknown MouseMoveSrc on a binding degrades to Unknown, not a load failure.
+        let text = r#"
+name = "tol"
+[bindings.Cross]
+[bindings.Cross.bind]
+kind = "MouseMove"
+val = "SomeFutureSource"
+"#;
+        let p = import_profile(text).expect("unknown enum string must not fail import");
+        assert_eq!(
+            p.bindings
+                .get(&crate::input::Control::Cross)
+                .map(|s| s.bind),
+            Some(BindTarget::MouseMove(
+                crate::map::binding::MouseMoveSrc::Unknown
+            ))
+        );
     }
 
     #[test]

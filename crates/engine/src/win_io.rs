@@ -24,14 +24,18 @@ use std::time::Duration;
 
 use hyperion_core::config::{EngineConfig, WaitMode as CfgWaitMode};
 use hyperion_core::input::{InputSample, SourceMeta};
-use hyperion_core::output::OutputState;
+use hyperion_core::output::{OutputState, PadTarget};
 use hyperion_core::stick::StickSample;
 
 use hid_input::win::hid::WaitMode as HidWaitMode;
 use hid_input::{DeviceSource as HidDeviceSource, DualSenseUsbSource, SourceError};
 use platform_win::hidhide::{HidHide, HidHideBackend};
 use platform_win::sched::{HotThreadConfig, WaitMode as SchedWaitMode};
-use vgamepad_output::{OutErr, Vigem360Pad, VirtualPad as VgVirtualPad};
+// `DynPad` (blueprint §6.3) is the static-dispatch X360-or-DS4 pad; its variant is chosen from the
+// active profile's `PadTarget` at (re)plug time via `DynPad::for_target`. It implements the
+// `vgamepad_output::VirtualPad` trait (`plugin/wait_ready/update/unplug`, brought into scope as
+// `VgVirtualPad`) which dispatches to the X360 / DS4 backend — no `dyn` on the hot path.
+use vgamepad_output::{DynPad, OutErr, VirtualPad as VgVirtualPad};
 
 use crate::handoff::KbmRx;
 use crate::hot::{DeviceSource, HotInput, VirtualPad};
@@ -256,40 +260,84 @@ fn ds_buttons_to_pad(raw: u32) -> hyperion_core::output::PadButtons {
     out
 }
 
-/// The engine-facing virtual pad: a plugged-in [`Vigem360Pad`].
+/// Read the active device's [`PadTarget`] (virtual-pad output kind) from a config snapshot.
 ///
-/// Construction plugs the target into ViGEmBus and waits for OS enumeration, so by the time the
-/// hot loop holds one, `update` is a single bounded IOCTL. `Drop` (via `Vigem360Pad`) unplugs.
-pub(crate) struct Vigem360Target {
-    pad: Vigem360Pad,
+/// Resolves `active_device -> assigned profile -> output_kind`, defaulting to
+/// [`PadTarget::X360`](hyperion_core::output::PadTarget) (the M2 default) when the device has no
+/// assignment / the profile is absent — so a fresh or mis-configured config plugs the byte-identical
+/// X360 pad. Read **only at (re)plug time** (blueprint §6.3 / §7.4), never per report.
+pub(crate) fn active_output_kind(cfg: &EngineConfig) -> PadTarget {
+    cfg.assignments
+        .get(&cfg.active_device)
+        .and_then(|pid| cfg.profiles.get(pid))
+        .map(|p| p.output_kind)
+        .unwrap_or_default()
 }
 
-impl Vigem360Target {
-    /// Create the Xbox-360 target, plug it into ViGEmBus, and wait for the OS to enumerate it.
+/// The engine-facing virtual pad: a plugged-in [`DynPad`] whose kind (X360 / DS4) was chosen from
+/// the active profile's [`PadTarget`](hyperion_core::output::PadTarget) at plug time (blueprint
+/// §6.3).
+///
+/// Construction plugs the target into ViGEmBus and waits for OS enumeration, so by the time the hot
+/// loop holds one, `update` is a single bounded IOCTL via static dispatch (no vtable on the hot
+/// path — `DynPad` is an enum, not a `dyn` trait object). `Drop` (via `DynPad`) unplugs. A runtime
+/// output-kind change is a full unplug → replug of a fresh `DynPad` of the new kind ([`replug`],
+/// driven by `HotCommand::ReplugTarget`), since ViGEm cannot morph a plugged target's type.
+///
+/// [`replug`]: DynPadTarget::replug
+pub(crate) struct DynPadTarget {
+    pad: DynPad,
+    /// The kind currently plugged, so a `ReplugTarget` that does not actually change the kind can
+    /// short-circuit (no needless disconnect/reconnect the game would see).
+    kind: PadTarget,
+}
+
+impl DynPadTarget {
+    /// Create the target for `kind`, plug it into ViGEmBus, and wait for the OS to enumerate it.
     ///
     /// Returns `None` if the ViGEmBus driver is unavailable or enumeration times out — the
-    /// supervisor maps that to a clean headless exit rather than a panic.
-    pub(crate) fn plugged() -> Option<Self> {
-        let mut pad = Vigem360Pad::new();
+    /// supervisor maps that to a clean headless exit rather than a panic. The default `kind`
+    /// ([`PadTarget::X360`](hyperion_core::output::PadTarget)) reproduces the M2 X360 egress exactly.
+    pub(crate) fn plugged(kind: PadTarget) -> Option<Self> {
+        let mut pad = DynPad::for_target(kind);
         pad.plugin().map_err(log_out_err).ok()?;
         pad.wait_ready(VIGEM_READY_TIMEOUT)
             .map_err(log_out_err)
             .ok()?;
-        Some(Self { pad })
+        Some(Self { pad, kind })
     }
 }
 
-impl VirtualPad for Vigem360Target {
+impl VirtualPad for DynPadTarget {
     type Error = OutErr;
 
-    /// Project the structured [`OutputState`] to the X360 [`OutputFrame`] and submit it. The
-    /// single i16/u8 round still happens in the `vgamepad-output` backend via `to_xinput_*`
-    /// (M3 keeps the X360 `OutputFrame` egress; the `OutputState`-native DS4 path lands in M5,
-    /// blueprint §6.3). `OutputState::to_output_frame` only packs the button word + copies the
-    /// f64 sticks/triggers, so the no-mid-chain-quantization invariant is intact.
+    /// Submit the structured [`OutputState`] to whichever virtual pad is plugged. `DynPad` performs
+    /// the single i16/u8 (X360) or u8 (DS4) round inside the backend (`to_xinput_*` / `to_ds4_axis`),
+    /// so the no-mid-chain-quantization invariant is intact and the X360 path stays byte-identical to
+    /// M2 (the X360 arm still goes through `OutputState::to_output_frame` → `to_xinput_*`).
     #[inline]
     fn update(&mut self, state: &OutputState) -> Result<(), Self::Error> {
-        self.pad.update(&state.to_output_frame())
+        self.pad.update(state)
+    }
+
+    /// Replug as a different output kind (blueprint §6.3): unplug the current `DynPad`, build + plug
+    /// a fresh one of `kind`, and wait for enumeration. A no-op (just `Ok`) when `kind` already
+    /// matches the plugged kind, so a `ReplugTarget` that does not change the output kind costs the
+    /// game no disconnect/reconnect. Runs on the hot thread (the ViGEm handle is thread-affine), but
+    /// only on the `ReplugTarget` command edge — never per report.
+    fn replug(&mut self, kind: PadTarget) -> Result<(), Self::Error> {
+        if kind == self.kind {
+            return Ok(());
+        }
+        // Drop the old target first (ViGEm cannot morph a plugged target's type — the game sees a
+        // disconnect), then plug + enumerate the new kind.
+        self.pad.unplug();
+        let mut pad = DynPad::for_target(kind);
+        pad.plugin()?;
+        pad.wait_ready(VIGEM_READY_TIMEOUT)?;
+        self.pad = pad;
+        self.kind = kind;
+        Ok(())
     }
 }
 
@@ -407,6 +455,55 @@ mod tests {
         assert_eq!(
             hi.buttons, XI_A,
             "fast-path XInput word packed from PadButtons"
+        );
+    }
+
+    // ---------------------------------- M5: output-kind resolution -------------------------------
+
+    use hyperion_core::map::Profile;
+    use std::sync::Arc;
+
+    fn cfg_with_kind(kind: PadTarget) -> EngineConfig {
+        let mut cfg = EngineConfig {
+            active_device: "dev".to_string(),
+            ..EngineConfig::default()
+        };
+        Arc::make_mut(&mut cfg.profiles).insert(
+            "p".to_string(),
+            Profile {
+                name: "p".to_string(),
+                output_kind: kind,
+                ..Profile::default()
+            },
+        );
+        cfg.assignments.insert("dev".to_string(), "p".to_string());
+        cfg
+    }
+
+    #[test]
+    fn active_output_kind_reads_assigned_profile() {
+        assert_eq!(
+            active_output_kind(&cfg_with_kind(PadTarget::Ds4)),
+            PadTarget::Ds4
+        );
+        assert_eq!(
+            active_output_kind(&cfg_with_kind(PadTarget::X360)),
+            PadTarget::X360
+        );
+    }
+
+    #[test]
+    fn active_output_kind_defaults_to_x360_when_unassigned() {
+        // No assignment / no profile -> the byte-identical M2 X360 default.
+        let cfg = EngineConfig {
+            active_device: "dev".to_string(),
+            ..EngineConfig::default()
+        };
+        assert_eq!(active_output_kind(&cfg), PadTarget::X360);
+        assert_eq!(
+            PadTarget::default(),
+            PadTarget::X360,
+            "default kind is X360"
         );
     }
 }

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use hyperion_core::config::{load_toml, to_toml, EngineConfig};
+use hyperion_core::config::{load_toml, to_toml, AutoSwitchRule, EngineConfig};
 use hyperion_core::map::{BindingSlot, Profile};
 
 use crate::control::{ControlMsg, Stick, Trigger};
@@ -380,8 +380,31 @@ fn edit_in_place(cfg: &mut EngineConfig, msg: &ControlMsg) {
             }
         }
 
-        // ---- M5 surface: accepted-but-no-op (consumer lands in M5) ----
-        ControlMsg::SetAutoSwitchEnabled(_) => { /* TODO(M5): toggle auto-switch */ }
+        // ---- Gyro settings (M5): mutate the active profile's gyro→mouse settings ----
+        ControlMsg::SetGyroSettings { profile, settings } => {
+            if let Some(p) = profile_mut(cfg, profile) {
+                p.gyro = *settings;
+            }
+        }
+
+        // ---- Auto-profile-switch (M5): mutate `cfg.auto_switch` (off the hot path) ----
+        ControlMsg::SetAutoSwitchEnabled(enabled) => {
+            cfg.auto_switch.enabled = *enabled;
+        }
+        ControlMsg::UpsertAutoSwitchRule { rule } => {
+            upsert_auto_switch_rule(&mut cfg.auto_switch.rules, rule.clone());
+        }
+        ControlMsg::DeleteAutoSwitchRule {
+            device,
+            exe_substr,
+            title_substr,
+        } => {
+            cfg.auto_switch.rules.retain(|r| {
+                !(r.device == *device
+                    && r.exe_substr == *exe_substr
+                    && r.title_substr == *title_substr)
+            });
+        }
 
         // Disk messages are handled before this function is reached.
         ControlMsg::SaveToDisk | ControlMsg::ReloadFromDisk => {}
@@ -402,6 +425,23 @@ fn upsert_by_id<T, K: Fn(&T) -> u16>(vec: &mut Vec<T>, item: T, key: K, id: u16)
     }
     let pos = vec.iter().position(|e| key(e) > id).unwrap_or(vec.len());
     vec.insert(pos, item); // new id: keep a sorted Vec sorted.
+}
+
+/// Insert-or-replace an auto-switch rule keyed by its `(device, exe_substr, title_substr)` match
+/// tuple. If a rule with that exact tuple exists, its `profile` is updated in place (so re-pointing
+/// a rule's target is an edit, not a duplicate); otherwise the rule is appended, preserving the
+/// first-match-wins evaluation order (`match_rules`, §7.4). Appending keeps the order the user added
+/// rules in, which is the order the watcher evaluates.
+fn upsert_auto_switch_rule(rules: &mut Vec<AutoSwitchRule>, rule: AutoSwitchRule) {
+    if let Some(existing) = rules.iter_mut().find(|r| {
+        r.device == rule.device
+            && r.exe_substr == rule.exe_substr
+            && r.title_substr == rule.title_substr
+    }) {
+        existing.profile = rule.profile; // same match tuple: just re-point the target profile.
+        return;
+    }
+    rules.push(rule);
 }
 
 /// Mutable borrow of the profile assigned to `device` (via `EngineConfig::assignments`), through
@@ -750,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn m5_messages_are_accepted_noops() {
+    fn absent_id_edits_are_accepted_noops() {
         let store = store_with_profile();
         let g0 = store.generation();
         // Deleting a macro that does not exist is a no-op (no panic, no bump).
@@ -758,8 +798,14 @@ mod tests {
             profile: "default".to_string(),
             id: 1,
         }));
-        // Auto-switch toggle is still an M5 placeholder no-op.
-        assert!(!store.apply(&ControlMsg::SetAutoSwitchEnabled(true)));
+        // Deleting an auto-switch rule that does not exist is also a no-op.
+        assert!(!store.apply(&ControlMsg::DeleteAutoSwitchRule {
+            device: String::new(),
+            exe_substr: "nope".to_string(),
+            title_substr: String::new(),
+        }));
+        // Re-setting auto-switch to its current (default `false`) value is a no-op.
+        assert!(!store.apply(&ControlMsg::SetAutoSwitchEnabled(false)));
         assert_eq!(store.generation(), g0);
     }
 
@@ -943,6 +989,112 @@ mod tests {
             })
         );
         assert_eq!(slot.shift_bind, BindTarget::GamepadButton(PadBtn::Y));
+    }
+
+    #[test]
+    fn apply_set_gyro_settings_mutates_and_resolves_clamped() {
+        use hyperion_core::map::profile::{GyroMode, GyroSettings};
+        let store = store_with_profile();
+        let settings = GyroSettings {
+            mode: GyroMode::AlwaysOn,
+            sensitivity: 9_999.0, // above the 100 clamp
+            invert_x: true,
+            ..GyroSettings::default()
+        };
+        assert!(store.apply(&ControlMsg::SetGyroSettings {
+            profile: "default".to_string(),
+            settings,
+        }));
+        let snap = store.snapshot();
+        // The editable profile carries the typed value; the resolved (hot-facing) form is clamped.
+        assert_eq!(snap.profiles["default"].gyro.mode, GyroMode::AlwaysOn);
+        assert!(snap.profiles["default"].gyro.invert_x);
+        let resolved = snap.resolved["dev"].gyro;
+        assert_eq!(
+            resolved.sensitivity, 100.0,
+            "resolved gyro sensitivity clamped"
+        );
+        assert_eq!(resolved.mode, GyroMode::AlwaysOn);
+    }
+
+    #[test]
+    fn apply_set_auto_switch_enabled_toggles() {
+        let store = store_with_profile();
+        assert!(!store.snapshot().auto_switch.enabled, "default is disabled");
+        assert!(store.apply(&ControlMsg::SetAutoSwitchEnabled(true)));
+        assert!(store.snapshot().auto_switch.enabled, "enabled");
+        // Re-enabling is a no-op.
+        assert!(!store.apply(&ControlMsg::SetAutoSwitchEnabled(true)));
+        // Disabling toggles back.
+        assert!(store.apply(&ControlMsg::SetAutoSwitchEnabled(false)));
+        assert!(!store.snapshot().auto_switch.enabled);
+    }
+
+    #[test]
+    fn apply_upsert_auto_switch_rule_inserts_then_repoints() {
+        let store = store_with_profile();
+        let rule = AutoSwitchRule {
+            device: String::new(),
+            exe_substr: "valorant".to_string(),
+            title_substr: String::new(),
+            profile: "default".to_string(),
+        };
+        assert!(store.apply(&ControlMsg::UpsertAutoSwitchRule { rule: rule.clone() }));
+        let snap = store.snapshot();
+        assert_eq!(snap.auto_switch.rules.len(), 1);
+        assert_eq!(snap.auto_switch.rules[0], rule);
+
+        // Upserting the SAME match tuple with a different profile re-points it in place (no append).
+        // Create the target profile first so the rule's profile id refers to something real.
+        assert!(store.apply(&ControlMsg::CreateProfile {
+            name: "fps".to_string(),
+        }));
+        let repointed = AutoSwitchRule {
+            profile: "fps".to_string(),
+            ..rule.clone()
+        };
+        assert!(store.apply(&ControlMsg::UpsertAutoSwitchRule {
+            rule: repointed.clone(),
+        }));
+        let snap = store.snapshot();
+        assert_eq!(
+            snap.auto_switch.rules.len(),
+            1,
+            "same tuple replaces, not appends"
+        );
+        assert_eq!(snap.auto_switch.rules[0].profile, "fps");
+
+        // A DIFFERENT match tuple appends a second rule (order preserved for first-match-wins).
+        let other = AutoSwitchRule {
+            exe_substr: "csgo".to_string(),
+            ..rule
+        };
+        assert!(store.apply(&ControlMsg::UpsertAutoSwitchRule {
+            rule: other.clone(),
+        }));
+        let snap = store.snapshot();
+        assert_eq!(snap.auto_switch.rules.len(), 2);
+        assert_eq!(snap.auto_switch.rules[1].exe_substr, "csgo");
+    }
+
+    #[test]
+    fn apply_delete_auto_switch_rule_removes_by_match_tuple() {
+        let store = store_with_profile();
+        let rule = AutoSwitchRule {
+            device: "dev".to_string(),
+            exe_substr: "game".to_string(),
+            title_substr: "Ranked".to_string(),
+            profile: "default".to_string(),
+        };
+        assert!(store.apply(&ControlMsg::UpsertAutoSwitchRule { rule: rule.clone() }));
+        assert_eq!(store.snapshot().auto_switch.rules.len(), 1);
+        // Delete by the exact match tuple.
+        assert!(store.apply(&ControlMsg::DeleteAutoSwitchRule {
+            device: "dev".to_string(),
+            exe_substr: "game".to_string(),
+            title_substr: "Ranked".to_string(),
+        }));
+        assert!(store.snapshot().auto_switch.rules.is_empty());
     }
 
     #[test]

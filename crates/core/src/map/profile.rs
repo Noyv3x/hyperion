@@ -15,7 +15,10 @@ use std::sync::Arc;
 
 use crate::input::{Control, Thresholds};
 use crate::map::binding::BindingSlot;
-use crate::mouse_accum::{MouseAccumCfg, MOUSE_VELOCITY_OFFSET_DEFAULT};
+use crate::mouse_accum::{
+    GyroAccumCfg, MouseAccumCfg, GYRO_MOUSE_DEADZONE_DEFAULT, GYRO_MOUSE_OFFSET_DEFAULT,
+    MOUSE_VELOCITY_OFFSET_DEFAULT,
+};
 use crate::output::{MouseButton, PadTarget};
 use crate::stick::settings::StickSettings;
 use crate::trigger::TriggerSettings;
@@ -46,7 +49,7 @@ pub struct Profile {
     /// Mouse-from-stick / wheel settings. **M4 consumer** ([`MouseSettings::to_accum_cfg`]).
     #[serde(default)]
     pub mouse: MouseSettings,
-    /// Gyro→mouse / gyro→stick settings. M5 consumer.
+    /// Gyro→mouse settings. **M5 consumer** ([`GyroSettings::to_accum_cfg`]).
     #[serde(default)]
     pub gyro: GyroSettings,
     /// Macro definitions referenced by `BindTarget::Macro(id)`. **M4 consumer** (the injector
@@ -155,10 +158,149 @@ impl MouseSettings {
     }
 }
 
-/// Forward-compat placeholder for gyro settings (M5). Inert in M3/M4.
-#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+/// When the gyro→mouse output is active (DS4Windows `gyroTriggerBehavior` / activation model).
+///
+/// `Off` disables gyro→mouse entirely (the default, so an unconfigured profile has inert gyro);
+/// `AlwaysOn` runs it every report; `TriggerHeld` runs it only while the gyro activation trigger is
+/// held (the engine evaluates the trigger against RAW state and gates [`apply`](crate::map::apply)'s
+/// gyro feed). The variant order/names are an append-only persisted-profile contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GyroMode {
+    /// Gyro→mouse disabled (default — inert, no behavior change for non-gyro users).
+    #[default]
+    Off,
+    /// Gyro→mouse runs every report (no activation gate).
+    AlwaysOn,
+    /// Gyro→mouse runs only while the activation trigger is held.
+    TriggerHeld,
+    /// Append-only fallback for an unknown persisted mode (degrades to `Off`).
+    #[serde(other)]
+    Unknown,
+}
+
+impl GyroMode {
+    /// `true` if gyro→mouse should run this report given whether the activation trigger is held.
+    ///
+    /// The engine owns reading the activation trigger; this folds the mode + trigger state into the
+    /// single "feed the gyro accumulator?" decision. `Off`/`Unknown` are always inert.
+    #[inline]
+    #[must_use]
+    pub fn is_active(self, trigger_held: bool) -> bool {
+        match self {
+            Self::AlwaysOn => true,
+            Self::TriggerHeld => trigger_held,
+            Self::Off | Self::Unknown => false,
+        }
+    }
+}
+
+/// Gyro→mouse settings (blueprint §12 M5; ground truth `Hyperion-ds4w/.../MouseCursor.cs::sixaxisMoved`).
+///
+/// The editable, persisted form; [`GyroSettings::clamped`] enforces the ranges and
+/// [`GyroSettings::to_accum_cfg`] projects it into the hot-facing
+/// [`GyroAccumCfg`](crate::mouse_accum::GyroAccumCfg) that [`apply`](crate::map::apply) feeds the
+/// gyro [`MouseAccumulator`](crate::mouse_accum::MouseAccumulator) via `gyro_velocity_step`.
+///
+/// Field semantics mirror DS4Windows `GyroMouseSens` / `GyroMouseInfo`:
+/// * `sensitivity` — master gyro speed (`gyroSensitivity·0.01` folded with the device coefficient);
+///   `1.0` ≈ the C# `gyroSensitivity == 100` default.
+/// * `vertical_scale` — `gyroSensVerticalScale·0.01`, scales the vertical (pitch) velocity only.
+/// * `deadzone` — `gyroCursorDeadZone` in the **gyro-rate domain** (NOT a normalized stick
+///   dead-zone); small tilts below it are suppressed.
+/// * `velocity_offset` — `mouseOffset`, the direction-split anti-jitter start offset.
+/// * `min_threshold` — per-report motion gate (`1.0` == the always-carry special case).
+/// * `jitter_comp` — enable the `^1.408` ease-in below the jitter threshold.
+/// * `invert_x` / `invert_y` — negate the final delta per axis (DS4Windows `gyroInvert` bits).
+/// * `swap_yaw_roll` — use roll instead of yaw for the horizontal axis (DS4Windows
+///   `getGyroMouseHorizontalAxis`); the engine selects which `Motion` rate feeds the X channel.
+/// * `mode` — when the gyro→mouse output is active ([`GyroMode`]).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-pub struct GyroSettings {}
+pub struct GyroSettings {
+    /// When the gyro→mouse output runs (default `Off` => inert).
+    pub mode: GyroMode,
+    /// Master gyro→mouse speed (DS4Windows `gyroSensitivity·0.01`).
+    pub sensitivity: f64,
+    /// Extra vertical (pitch) velocity scale (DS4Windows `gyroSensVerticalScale·0.01`).
+    pub vertical_scale: f64,
+    /// Gyro-rate-domain dead-zone (DS4Windows `gyroCursorDeadZone`).
+    pub deadzone: f64,
+    /// Direction-split anti-jitter offset (DS4Windows `mouseOffset`).
+    pub velocity_offset: f64,
+    /// Per-report motion gate (`1.0` == always-carry special case).
+    pub min_threshold: f64,
+    /// Enable the `^1.408` jitter-compensation ease curve.
+    pub jitter_comp: bool,
+    /// Invert the horizontal (X) output.
+    pub invert_x: bool,
+    /// Invert the vertical (Y) output.
+    pub invert_y: bool,
+    /// Use roll (instead of yaw) for the horizontal axis (DS4Windows horizontal-axis swap).
+    pub swap_yaw_roll: bool,
+}
+
+impl Default for GyroSettings {
+    /// Inert defaults: gyro→mouse `Off`, DS4Windows-class tunables for when it is enabled. An
+    /// unconfigured profile therefore behaves exactly like the M3/M4 placeholder (no gyro output),
+    /// so adding these fields is non-breaking.
+    fn default() -> Self {
+        Self {
+            mode: GyroMode::Off,
+            sensitivity: 1.0,
+            vertical_scale: 1.0,
+            deadzone: GYRO_MOUSE_DEADZONE_DEFAULT,
+            velocity_offset: GYRO_MOUSE_OFFSET_DEFAULT,
+            min_threshold: 1.0,
+            jitter_comp: true,
+            invert_x: false,
+            invert_y: false,
+            swap_yaw_roll: false,
+        }
+    }
+}
+
+impl GyroSettings {
+    /// Clamp every field into its valid range (called off the hot path, in `resolve()` / the
+    /// config-store funnel). Non-finite inputs collapse to the default before clamping. The mode +
+    /// the bool flags pass through unchanged; `min_threshold` floors at the always-carry `1.0`.
+    #[inline]
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        let d = Self::default();
+        let fin = |v: f64, fallback: f64| if v.is_finite() { v } else { fallback };
+        Self {
+            mode: self.mode,
+            sensitivity: fin(self.sensitivity, d.sensitivity).clamp(0.01, 100.0),
+            vertical_scale: fin(self.vertical_scale, d.vertical_scale).clamp(0.1, 10.0),
+            deadzone: fin(self.deadzone, d.deadzone).clamp(0.0, 1000.0),
+            velocity_offset: fin(self.velocity_offset, d.velocity_offset).clamp(0.0, 10.0),
+            min_threshold: fin(self.min_threshold, d.min_threshold).max(1.0),
+            jitter_comp: self.jitter_comp,
+            invert_x: self.invert_x,
+            invert_y: self.invert_y,
+            swap_yaw_roll: self.swap_yaw_roll,
+        }
+    }
+
+    /// Project into the hot-facing [`GyroAccumCfg`] the engine feeds `gyro_velocity_step`. Call after
+    /// `clamped()` has run in `resolve()`. The `mode`/`swap_yaw_roll` fields are NOT part of the
+    /// accumulator config (the engine consumes them to gate + axis-select the feed); only the
+    /// velocity-model tunables flow into [`GyroAccumCfg`].
+    #[inline]
+    #[must_use]
+    pub fn to_accum_cfg(self) -> GyroAccumCfg {
+        GyroAccumCfg {
+            sensitivity: self.sensitivity,
+            vertical_scale: self.vertical_scale,
+            velocity_offset: self.velocity_offset,
+            deadzone: self.deadzone,
+            min_threshold: self.min_threshold,
+            jitter_comp: self.jitter_comp,
+            invert_x: self.invert_x,
+            invert_y: self.invert_y,
+        }
+    }
+}
 
 /// One mouse-button selector inside a [`MacroStep`] (kept separate from [`MouseButton`] only so the
 /// serde form is explicit/append-only). Maps 1:1 to [`MouseButton`].
@@ -280,6 +422,9 @@ impl Profile {
             // M4: clamped mouse-from-stick settings (consumed by `apply()` via `to_accum_cfg`) and
             // an Arc-shared macro table (consumed by the injector thread, never the hot path).
             mouse: self.mouse.clamped(),
+            // M5: clamped gyro→mouse settings (consumed by `apply()` via `to_accum_cfg` when
+            // `gyro.mode` is active).
+            gyro: self.gyro.clamped(),
             macros: Arc::from(self.macros.clone()),
         }
     }
@@ -292,8 +437,10 @@ impl Profile {
 ///
 /// M3 held the `base` slot array + clamped stick/trigger settings + thresholds + output kind. M4
 /// adds the resolved `mouse` settings (consumed by `apply()` via [`MouseSettings::to_accum_cfg`])
-/// and the `macros` table (consumed off the hot path by the injector thread). The per-control shift
-/// table is read from `base` each report; gyro/special resolution lands in M5.
+/// and the `macros` table (consumed off the hot path by the injector thread). M5 adds the resolved
+/// `gyro` settings (consumed by `apply()` via [`GyroSettings::to_accum_cfg`] when its mode is
+/// active). The per-control shift table is read from `base` each report; special resolution is
+/// handled via the `Special` binding edge.
 ///
 /// Not `Copy`: the `macros` table is an `Arc<[MacroDef]>` (cheap to `Clone`, refcount-shared so a
 /// per-generation rebuild does not deep-copy the step lists — blueprint §7.1). Everything the hot
@@ -320,6 +467,10 @@ pub struct ResolvedProfile {
     /// Resolved (clamped) mouse-from-stick settings; `apply()` calls
     /// [`to_accum_cfg`](MouseSettings::to_accum_cfg) to feed the mouse accumulator.
     pub mouse: MouseSettings,
+    /// Resolved (clamped) gyro→mouse settings (M5); `apply()` calls
+    /// [`to_accum_cfg`](GyroSettings::to_accum_cfg) to feed the gyro accumulator when
+    /// [`GyroSettings::mode`] is active. `Copy`, read inline on the hot path.
+    pub gyro: GyroSettings,
     /// The profile's macro table, Arc-shared so a generation rebuild is a refcount bump (the hot
     /// path never reads this; the injector thread plays a macro on a `Macro{start}` edge).
     pub macros: Arc<[MacroDef]>,
@@ -337,6 +488,7 @@ impl Default for ResolvedProfile {
             thresholds: Thresholds::default(),
             output_kind: PadTarget::default(),
             mouse: MouseSettings::default(),
+            gyro: GyroSettings::default(),
             macros: Arc::from(Vec::new()),
         }
     }
@@ -534,5 +686,139 @@ mod tests {
             MacroMouseButton::Unknown.to_mouse_button(),
             crate::output::MouseButton::Left
         );
+    }
+
+    // -------------------------------------- M5 gyro settings -------------------------------------
+
+    #[test]
+    fn gyro_settings_default_is_inert_off() {
+        // The default gyro mode is Off so an unconfigured profile produces no gyro output (no
+        // behavior change for non-gyro users).
+        let g = GyroSettings::default();
+        assert_eq!(g.mode, GyroMode::Off);
+        assert!(
+            !g.mode.is_active(true),
+            "Off is inert even when trigger held"
+        );
+        assert!(!g.mode.is_active(false));
+    }
+
+    #[test]
+    fn gyro_mode_activation() {
+        assert!(GyroMode::AlwaysOn.is_active(false));
+        assert!(GyroMode::AlwaysOn.is_active(true));
+        assert!(!GyroMode::TriggerHeld.is_active(false));
+        assert!(GyroMode::TriggerHeld.is_active(true));
+        assert!(!GyroMode::Off.is_active(true));
+        assert!(!GyroMode::Unknown.is_active(true));
+    }
+
+    #[test]
+    fn gyro_settings_clamp_bounds_and_non_finite() {
+        let wild = GyroSettings {
+            mode: GyroMode::AlwaysOn,
+            sensitivity: 9_999.0,
+            vertical_scale: 0.0,    // below the 0.1 floor
+            deadzone: -5.0,         // below 0
+            velocity_offset: 999.0, // above 10
+            min_threshold: 0.0,     // below the 1.0 floor
+            jitter_comp: false,
+            invert_x: true,
+            invert_y: true,
+            swap_yaw_roll: true,
+        };
+        let c = wild.clamped();
+        assert_eq!(c.mode, GyroMode::AlwaysOn, "mode passes through clamp");
+        assert_eq!(c.sensitivity, 100.0);
+        assert_eq!(c.vertical_scale, 0.1);
+        assert_eq!(c.deadzone, 0.0);
+        assert_eq!(c.velocity_offset, 10.0);
+        assert_eq!(
+            c.min_threshold, 1.0,
+            "min_threshold floors at the always-carry 1.0"
+        );
+        assert!(!c.jitter_comp && c.invert_x && c.invert_y && c.swap_yaw_roll);
+
+        // Non-finite inputs collapse to the default before clamping.
+        let nan = GyroSettings {
+            sensitivity: f64::NAN,
+            min_threshold: f64::INFINITY,
+            ..GyroSettings::default()
+        }
+        .clamped();
+        assert_eq!(nan.sensitivity, GyroSettings::default().sensitivity);
+        assert!(nan.min_threshold.is_finite());
+    }
+
+    #[test]
+    fn gyro_settings_to_accum_cfg_carries_velocity_tunables() {
+        let g = GyroSettings {
+            mode: GyroMode::TriggerHeld, // not part of the accum cfg
+            sensitivity: 30.0,
+            vertical_scale: 1.5,
+            deadzone: 8.0,
+            velocity_offset: 0.2,
+            min_threshold: 2.0,
+            jitter_comp: false,
+            invert_x: true,
+            invert_y: false,
+            swap_yaw_roll: true, // not part of the accum cfg
+        };
+        let cfg = g.to_accum_cfg();
+        assert_eq!(cfg.sensitivity, 30.0);
+        assert_eq!(cfg.vertical_scale, 1.5);
+        assert_eq!(cfg.deadzone, 8.0);
+        assert_eq!(cfg.velocity_offset, 0.2);
+        assert_eq!(cfg.min_threshold, 2.0);
+        assert!(!cfg.jitter_comp);
+        assert!(cfg.invert_x && !cfg.invert_y);
+    }
+
+    #[test]
+    fn resolve_clamps_gyro_and_default_is_off() {
+        let p = Profile {
+            gyro: GyroSettings {
+                mode: GyroMode::AlwaysOn,
+                sensitivity: -3.0, // clamps up to the 0.01 floor
+                ..GyroSettings::default()
+            },
+            ..Profile::default()
+        };
+        let rp = p.resolve();
+        assert_eq!(rp.gyro.mode, GyroMode::AlwaysOn);
+        assert_eq!(rp.gyro.sensitivity, 0.01, "resolve clamps gyro settings");
+
+        // A default profile resolves to inert (Off) gyro.
+        assert_eq!(ResolvedProfile::default().gyro.mode, GyroMode::Off);
+    }
+
+    #[test]
+    fn profile_with_gyro_round_trips() {
+        let p = Profile {
+            name: "gyro-test".to_string(),
+            gyro: GyroSettings {
+                mode: GyroMode::TriggerHeld,
+                sensitivity: 45.0,
+                invert_y: true,
+                swap_yaw_roll: true,
+                ..GyroSettings::default()
+            },
+            ..Default::default()
+        };
+        let toml = toml::to_string(&p).unwrap();
+        let back: Profile = toml::from_str(&toml).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn gyro_mode_unknown_serde_fallback() {
+        // An unrecognized persisted mode degrades to Unknown (inert), not a load failure.
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            mode: GyroMode,
+        }
+        let back: Wrap = toml::from_str("mode = \"SomeFutureMode\"\n").unwrap();
+        assert_eq!(back.mode, GyroMode::Unknown);
+        assert!(!back.mode.is_active(true));
     }
 }

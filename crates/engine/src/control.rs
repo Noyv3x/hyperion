@@ -17,14 +17,20 @@
 //! [`ControlMsg::UpsertSpecialAction`]/[`ControlMsg::DeleteSpecialAction`],
 //! [`ControlMsg::SetMouseSettings`], [`ControlMsg::SetBindingTurbo`], and
 //! [`ControlMsg::SetShiftTrigger`] all mutate the active profile in [`crate::config_store`] now.
-//! The gyro / auto-switch variants remain forward-compat (their consumers land in M5).
+//!
+//! # Scope (M5)
+//! **M5** adds the gyro + auto-switch edits: [`ControlMsg::SetGyroSettings`] mutates a profile's
+//! `gyro` (consumed by `apply`'s gyro accumulator), and
+//! [`ControlMsg::SetAutoSwitchEnabled`]/[`ControlMsg::UpsertAutoSwitchRule`]/
+//! [`ControlMsg::DeleteAutoSwitchRule`] mutate `EngineConfig::auto_switch` (consumed by the
+//! `cfg(windows)` `ForegroundWatcher`, which sends [`ControlMsg::SetActiveProfile`] on a match).
 
 use std::sync::Arc;
 
-use hyperion_core::config::{HidHideConfig, StickMode, ThreadConfig};
+use hyperion_core::config::{AutoSwitchRule, HidHideConfig, StickMode, ThreadConfig};
 use hyperion_core::input::Control;
 use hyperion_core::map::{
-    BindTarget, MacroDef, MouseSettings, ShiftTrigger, SpecialAction, TurboCfg,
+    BindTarget, GyroSettings, MacroDef, MouseSettings, ShiftTrigger, SpecialAction, TurboCfg,
 };
 use hyperion_core::output::{KbmBatch, KbmEvent, PadTarget};
 use hyperion_core::rc::RcConfig;
@@ -246,9 +252,39 @@ pub enum ControlMsg {
         id: u16,
     },
 
-    // ---- M5 surface: accepted-but-no-op (consumers land later; §9) ----
-    /// Enable / disable foreground auto-profile-switching. **M5 consumer** (no-op until M5).
+    // ---- Gyro settings (M5 consumer; §9) ----
+    /// Replace a profile's gyro→mouse settings (clamped on apply). **M5 consumer**: the resolved
+    /// form feeds `apply`'s gyro [`MouseAccumulator`](hyperion_core::mouse_accum::MouseAccumulator)
+    /// via `gyro_velocity_step` when [`GyroMode`](hyperion_core::map::profile::GyroMode) is active.
+    SetGyroSettings {
+        /// Profile id.
+        profile: String,
+        /// The new gyro settings (validated/clamped by the writer).
+        settings: GyroSettings,
+    },
+
+    // ---- Auto-profile-switch (M5 consumer: the `ForegroundWatcher`; §7.4, §9) ----
+    /// Enable / disable foreground auto-profile-switching (`EngineConfig::auto_switch.enabled`).
+    /// **M5 consumer**: the `ForegroundWatcher` only polls + matches while this is `true`.
     SetAutoSwitchEnabled(bool),
+    /// Insert or replace an auto-switch rule (keyed by its full `(device, exe_substr, title_substr)`
+    /// match tuple, so re-pointing an existing rule's `profile` is an in-place update). Appends a new
+    /// rule when no rule with that match tuple exists. **M5 consumer**: `match_rules` walks the list
+    /// in order (first match wins, §7.4).
+    UpsertAutoSwitchRule {
+        /// The rule to insert or replace (its match tuple is the logical key).
+        rule: AutoSwitchRule,
+    },
+    /// Delete the auto-switch rule whose `(device, exe_substr, title_substr)` match tuple equals the
+    /// given one. No-op if no such rule exists. **M5 consumer**.
+    DeleteAutoSwitchRule {
+        /// Device id of the rule to delete (empty == "any device").
+        device: String,
+        /// Exe-substring match key of the rule to delete.
+        exe_substr: String,
+        /// Title-substring match key of the rule to delete.
+        title_substr: String,
+    },
 }
 
 /// An event the hot loop sends **out** to the control plane (blueprint §5/§12 M4: "Special edges to
@@ -279,6 +315,53 @@ pub type ControlPlaneTx = crossbeam_channel::Sender<ControlPlaneEvent>;
 
 /// The control-plane side of the channel: the consumer the supervisor drains off the hot path.
 pub type ControlPlaneRx = crossbeam_channel::Receiver<ControlPlaneEvent>;
+
+/// Decide the auto-profile-switch edit for the current foreground app (blueprint §7.4, §12 M5).
+///
+/// Pure + Linux-testable: this is the whole decision the `cfg(windows)` `ForegroundWatcher` makes
+/// each poll, factored out of the OS read so it is unit-tested without Windows. Given the live
+/// config snapshot and the foreground executable path + window title, it:
+///
+/// 1. does nothing unless `auto_switch.enabled` (the master gate),
+/// 2. runs the **pure** [`match_rules_for_device`](hyperion_core::autoswitch::match_rules_for_device)
+///    against the active device's rules (first-match-wins, device-scoped, §7.4),
+/// 3. returns a [`ControlMsg::SetActiveProfile`] **only** when a rule matches a profile that both
+///    exists and differs from the device's current assignment — so an unchanged foreground (or a
+///    rule pointing at the already-active profile) sends nothing and the single writer never bumps
+///    the generation needlessly.
+///
+/// The watcher feeds the returned message into the **same** single-writer `ControlMsg` channel the
+/// GUI uses (never the hot path); the hot loop picks the switch up through the existing generation
+/// gate. A `None` keeps the current profile (the watcher just doesn't switch).
+#[must_use]
+pub fn auto_switch_decision(
+    cfg: &hyperion_core::config::EngineConfig,
+    exe: &str,
+    title: &str,
+) -> Option<ControlMsg> {
+    if !cfg.auto_switch.enabled {
+        return None;
+    }
+    let device = cfg.active_device.as_str();
+    let matched = hyperion_core::autoswitch::match_rules_for_device(
+        &cfg.auto_switch.rules,
+        device,
+        exe,
+        title,
+    )?;
+    // Only switch to a real profile, and only when it differs from what the device already runs
+    // (so a steady foreground / a redundant rule never churns the generation).
+    if !cfg.profiles.contains_key(matched) {
+        return None;
+    }
+    if cfg.assignments.get(device).map(String::as_str) == Some(matched) {
+        return None;
+    }
+    Some(ControlMsg::SetActiveProfile {
+        device: device.to_string(),
+        name: matched.to_string(),
+    })
+}
 
 /// Forward every `Special(id)` rising edge in `batch` to the control plane, non-blocking.
 ///
@@ -350,5 +433,108 @@ mod tests {
         batch.push(KbmEvent::Special { id: 42 });
         // Returns the count it tried to forward; the send itself is dropped silently.
         assert_eq!(forward_specials(&batch, &tx), 1);
+    }
+
+    // ----------------------------- M5: foreground auto-switch decision ---------------------------
+
+    use hyperion_core::config::{AutoSwitchConfig, AutoSwitchRule, EngineConfig};
+    use hyperion_core::map::Profile;
+
+    /// A config with device `"dev"` assigned to `"default"`, plus a second profile `"fps"`, and an
+    /// auto-switch rule list. `enabled` toggles the master gate.
+    fn cfg_with_rules(enabled: bool, rules: Vec<AutoSwitchRule>) -> EngineConfig {
+        let mut cfg = EngineConfig {
+            active_device: "dev".to_string(),
+            auto_switch: AutoSwitchConfig {
+                enabled,
+                poll_hz: 4,
+                rules,
+            },
+            ..EngineConfig::default()
+        };
+        let profiles = Arc::make_mut(&mut cfg.profiles);
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("fps".to_string(), Profile::default());
+        cfg.assignments
+            .insert("dev".to_string(), "default".to_string());
+        cfg
+    }
+
+    fn rule(exe: &str, profile: &str) -> AutoSwitchRule {
+        AutoSwitchRule {
+            device: String::new(),
+            exe_substr: exe.to_string(),
+            title_substr: String::new(),
+            profile: profile.to_string(),
+        }
+    }
+
+    #[test]
+    fn auto_switch_decision_matches_rule_and_switches() {
+        let cfg = cfg_with_rules(true, vec![rule("valorant", "fps")]);
+        let msg = auto_switch_decision(&cfg, "C:/Riot/valorant.exe", "VALORANT");
+        match msg {
+            Some(ControlMsg::SetActiveProfile { device, name }) => {
+                assert_eq!(device, "dev");
+                assert_eq!(
+                    name, "fps",
+                    "foreground exe match -> switch to the rule's profile"
+                );
+            }
+            other => panic!("expected SetActiveProfile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_switch_decision_disabled_is_none() {
+        // The master gate off => no switch even with a matching rule.
+        let cfg = cfg_with_rules(false, vec![rule("valorant", "fps")]);
+        assert!(auto_switch_decision(&cfg, "valorant.exe", "VALORANT").is_none());
+    }
+
+    #[test]
+    fn auto_switch_decision_no_match_is_none() {
+        let cfg = cfg_with_rules(true, vec![rule("valorant", "fps")]);
+        assert!(
+            auto_switch_decision(&cfg, "C:/desktop/explorer.exe", "Desktop").is_none(),
+            "a non-matching foreground keeps the current profile"
+        );
+    }
+
+    #[test]
+    fn auto_switch_decision_already_active_is_none() {
+        // A rule that matches the profile the device ALREADY runs sends nothing (no churn).
+        let cfg = cfg_with_rules(true, vec![rule("valorant", "default")]);
+        assert!(
+            auto_switch_decision(&cfg, "valorant.exe", "x").is_none(),
+            "matching the already-assigned profile is a no-op"
+        );
+    }
+
+    #[test]
+    fn auto_switch_decision_unknown_profile_is_none() {
+        // A rule pointing at a non-existent profile is ignored (never assign a missing id).
+        let cfg = cfg_with_rules(true, vec![rule("valorant", "ghost")]);
+        assert!(auto_switch_decision(&cfg, "valorant.exe", "x").is_none());
+    }
+
+    #[test]
+    fn auto_switch_decision_first_match_wins() {
+        // Two matching rules; the first in the list wins (mirrors match_rules ordering).
+        let cfg = cfg_with_rules(true, vec![rule("game", "fps"), rule("game", "default")]);
+        let msg = auto_switch_decision(&cfg, "mygame.exe", "x");
+        assert!(matches!(
+            msg,
+            Some(ControlMsg::SetActiveProfile { name, .. }) if name == "fps"
+        ));
+    }
+
+    #[test]
+    fn auto_switch_decision_respects_device_scope() {
+        // A rule scoped to a DIFFERENT device must not fire for the active device.
+        let mut r = rule("game", "fps");
+        r.device = "other".to_string();
+        let cfg = cfg_with_rules(true, vec![r]);
+        assert!(auto_switch_decision(&cfg, "mygame.exe", "x").is_none());
     }
 }

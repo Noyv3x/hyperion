@@ -12,11 +12,12 @@ hyperion-core = { path = "../core" }
 
 # Pure-Rust ViGEmBus FFI (Win32 bindings via the `windows` crate; no build.rs / no Windows SDK
 # required, so it type-checks under `cargo check --target x86_64-pc-windows-msvc` on Linux).
-# `default-features = false` drops the DualShock 4 surface; we only need the Xbox 360 target.
+# We need BOTH targets in M5: the Xbox 360 path (unchanged) and the new DualShock 4 path that
+# `DynPad`/`VigemDs4Pad` drive when a profile's `OutputKind == Ds4` (blueprint §6.3).
 [target.'cfg(windows)'.dependencies.vigem-rust]
 version = "0.1.1"
 default-features = false
-features = ["x360"]
+features = ["x360", "ds4"]
 
 [lints]
 workspace = true

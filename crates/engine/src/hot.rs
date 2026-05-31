@@ -117,6 +117,18 @@ pub trait VirtualPad {
     /// Submit one frame via a single synchronous, bounded IOCTL (must never block the
     /// TIME_CRITICAL hot thread in the driver — §6).
     fn update(&mut self, state: &OutputState) -> Result<(), Self::Error>;
+
+    /// Replug the virtual target as a (possibly different) output kind (blueprint §6.3): a full
+    /// unplug → replug, since ViGEm cannot morph a plugged target's type (the game sees a
+    /// disconnect/reconnect). Called **only** on the [`HotCommand::ReplugTarget`] edge — never per
+    /// report — and on the hot thread (the ViGEm handle is thread-affine). A target whose kind is
+    /// already `kind` should no-op. The default impl is a no-op, so a test / X360-only target need
+    /// not implement it; the real `DynPad`-backed target overrides it.
+    #[inline]
+    fn replug(&mut self, kind: hyperion_core::output::PadTarget) -> Result<(), Self::Error> {
+        let _ = kind;
+        Ok(())
+    }
 }
 
 /// Why the hot loop stopped.
@@ -167,6 +179,11 @@ struct Resident {
     /// Fast-path flag: the resolved profile is the trivial all-`Passthrough` map, so the hot loop
     /// builds the `OutputFrame` directly (byte-identical to M2) and skips `map::apply`.
     passthrough_only: bool,
+    /// Sub-pixel flick-stick carry, one per stick (`0` = LS, `1` = RS). The flick consumer
+    /// (`route_flick`) accumulates the fractional mouse-X delta here so a slow relative-aim sweep
+    /// is not lost to truncation; the whole-pixel part is emitted, the remainder kept (blueprint
+    /// §4 stage 9 / §12 M5 flick-consumer contract). `Default` (0.0) is the clean post-reset state.
+    flick_remainder: [f64; 2],
 }
 
 impl Resident {
@@ -184,6 +201,7 @@ impl Resident {
             stick_settings,
             trig_settings,
             passthrough_only,
+            flick_remainder: [0.0; 2],
         }
     }
 
@@ -203,6 +221,7 @@ impl Resident {
         self.stick_state = Default::default();
         self.trig_state = Default::default();
         self.map_state = MapState::default();
+        self.flick_remainder = [0.0; 2];
     }
 
     /// Per-report prime path (engine `input.is_prime`), distinct from the command-driven full
@@ -211,6 +230,10 @@ impl Resident {
     fn prime(&mut self) {
         self.stick_state[0].prime_reset();
         self.stick_state[1].prime_reset();
+        // The per-stick flick anchor is re-seeded by `prime_reset` (it zeroes `flick_delta`), so
+        // drop the matching sub-pixel carry too — a fresh post-enable sweep must not fold a stale
+        // fraction from before the prime into its first emitted mouse delta.
+        self.flick_remainder = [0.0; 2];
         // Trigger state has no priming history (the chain is stateless modulo edge tracking), but
         // clear the digital edge latch so a held trigger across a replug re-edges cleanly.
         self.trig_state = Default::default();
@@ -256,6 +279,11 @@ where
         let mut applied_gen: u64 = 0;
         let mut cfg: EngineConfig = (*self.config.load_full()).clone();
         let mut res = Resident::resolve(&cfg);
+        // The output kind the virtual target is currently plugged as. The supervisor plugged the
+        // target from this same `active_output_kind(&cfg)` before constructing the hot thread, so
+        // the two start in sync; a later config edit that changes the active profile's output kind
+        // is detected on the generation gate and triggers a replug (blueprint §6.3).
+        let mut plugged_kind = crate::win_io::active_output_kind(&cfg);
         // Hand the initial macro table to the control plane (→ injector's MacroPlayer). Re-sent on
         // every profile change below so the player always has the active profile's macros.
         self.publish_macros(&res);
@@ -267,9 +295,22 @@ where
             // Drain BOTH command queues first so a Shutdown is honored promptly.
             while let Some(cmd) = self.commands.try_pop() {
                 match cmd {
-                    HotCommand::ResetFilter
-                    | HotCommand::Recalibrate
-                    | HotCommand::ReplugTarget => {
+                    HotCommand::ResetFilter | HotCommand::Recalibrate => {
+                        res.reset();
+                        clock.reset();
+                    }
+                    HotCommand::ReplugTarget => {
+                        // Re-plug the virtual target as the active profile's current output kind
+                        // (blueprint §6.3): a runtime X360↔DS4 switch is a full unplug/replug on the
+                        // hot thread (the ViGEm handle is thread-affine), driven only by this command
+                        // edge — never per report. `replug` no-ops when the kind is unchanged, so a
+                        // plain "re-create the target" reset does not needlessly disconnect the game.
+                        // A failed replug (driver gone) is a clean device-loss exit.
+                        let kind = crate::win_io::active_output_kind(&self.config.load_full());
+                        if self.target.replug(kind).is_err() {
+                            return StopReason::DeviceLost;
+                        }
+                        plugged_kind = kind;
                         res.reset();
                         clock.reset();
                     }
@@ -296,6 +337,22 @@ where
                 // A profile (re)assignment or macro edit may have changed the macro table; re-publish
                 // it to the injector off the per-report path (this runs only on the generation gate).
                 self.publish_macros(&res);
+                // If the edit changed the active profile's output kind (a `SetOutputKind`, or an
+                // assignment / auto-switch to a profile with a different `PadTarget`), replug the
+                // virtual target as the new kind (blueprint §6.3). Runs only on the generation gate,
+                // not per report; `replug` no-ops when the kind is unchanged. A failed replug means
+                // the driver is gone → clean device-loss exit.
+                let active_kind = crate::win_io::active_output_kind(&cfg);
+                if active_kind != plugged_kind {
+                    if self.target.replug(active_kind).is_err() {
+                        return StopReason::DeviceLost;
+                    }
+                    plugged_kind = active_kind;
+                    // A replug is a fresh target; re-prime the filter/mapping state so a held key /
+                    // mid-flick does not carry across the disconnect (mirrors the ReplugTarget reset).
+                    res.reset();
+                    clock.reset();
+                }
             }
 
             let dt = Dt::guarded(input.dt_us);
@@ -352,7 +409,17 @@ where
                 let state = controller_state_from(&input, filt_l, filt_r, lt_analog, rt_analog);
                 // `now_us` reuses the existing clock read (verifier latency FIX 3) — no 2nd QPC.
                 let now_us = busy_start / 1000;
-                let (out, kbm) = apply(&state, &res.resolved, &mut res.map_state, now_us);
+                let (out, mut kbm) = apply(&state, &res.resolved, &mut res.map_state, now_us);
+                // Flick-stick consumer (blueprint §4 stage 9 / §12 M5): the stick pipeline stashed
+                // each stick's per-report relative-aim turn in `stick_state[i].flick_delta`; route
+                // it into the SAME mouse batch as a horizontal `MouseMove` (dy stays 0). Off the
+                // alloc path — only touches the batch when a flick is actually in progress.
+                route_flick(
+                    &res.stick_state,
+                    &res.stick_settings,
+                    &mut res.flick_remainder,
+                    &mut kbm,
+                );
                 // Route `Special` rising edges OUT of the KBM batch to the control plane (profile
                 // switch etc. run off the hot path, §5/§12 M4). The key/mouse/macro edges still go
                 // to the injector ring (it ignores `Special` defensively). Both are non-blocking.
@@ -420,13 +487,90 @@ fn resolve_active(cfg: &EngineConfig) -> Arc<ResolvedProfile> {
 }
 
 /// Whether every control in the resolved profile is the trivial identity `Passthrough` (no shift,
-/// no turbo) — the condition for the byte-identical M2 fast path. Computed once on the gate.
+/// no turbo) **and** neither stick has flick-stick enabled — the condition for the byte-identical
+/// M2 fast path. Computed once on the gate.
+///
+/// Flick-stick is the one stick-settings stage that produces an out-of-band output (a mouse delta,
+/// routed by [`route_flick`] only in the general path), so an enabled flick must leave the fast
+/// path even when every binding is identity. RC / deadzone / curve / etc. only reshape the stick
+/// value itself (still byte-identical egress), so they do **not** force the general path.
 #[inline]
 fn is_all_passthrough(rp: &ResolvedProfile) -> bool {
-    Control::ALL.iter().all(|&c| {
+    let bindings_identity = Control::ALL.iter().all(|&c| {
         let s = rp.slot(c);
         matches!(s.bind, BindTarget::Passthrough) && s.shift_trigger.is_none() && s.turbo.is_none()
-    })
+    });
+    bindings_identity && !rp.ls.flick.enabled && !rp.rs.flick.enabled
+}
+
+/// Route each stick's stashed flick-stick relative-aim turn into the mouse output (blueprint §4
+/// stage 9 / §12 M5 flick-consumer contract).
+///
+/// The resolved stick pipeline (`process_stick`) runs in the hot loop and stashes the per-report
+/// relative turn in `StickState::flick_delta` (radians; the absolute stick is returned unchanged),
+/// so `apply()` never sees it — the engine merges it into the returned [`KbmBatch`] here. Only a
+/// stick whose `flick.enabled` is set contributes, so an unconfigured profile produces no flick
+/// motion (and the M3/M4 goldens stay byte-identical: `flick.enabled` defaults `false`). Flick is a
+/// horizontal turn, so `dy` is always `0`. A dedicated per-stick sub-pixel `remainder` carries the
+/// fractional pixel across reports; the whole-pixel part is emitted as a single `MouseMove`.
+///
+/// Off the alloc path: the only work when no flick is active is two `f64` reads + a `!= 0.0`
+/// compare. The merged event is the SAME [`KbmEvent::MouseMove`] the stick/gyro mouse path emits,
+/// so the KBM injector needs no new event type.
+#[inline]
+fn route_flick(
+    stick_state: &[StickState; 2],
+    stick_settings: &[StickSettings; 2],
+    remainder: &mut [f64; 2],
+    kbm: &mut hyperion_core::output::KbmBatch,
+) {
+    use hyperion_core::output::KbmEvent;
+    let mut dx_total: i32 = 0;
+    for i in 0..2 {
+        // Only an enabled flick stick contributes; a disabled one keeps its carry at rest so a
+        // later enable starts clean (the carry is also cleared on prime/reset).
+        if !stick_settings[i].flick.enabled {
+            remainder[i] = 0.0;
+            continue;
+        }
+        let delta = stick_state[i].flick_delta;
+        if delta == 0.0 {
+            continue;
+        }
+        // Accumulate the scaled turn plus the prior sub-pixel carry; emit the whole-pixel part and
+        // keep the fraction so a slow sweep is not truncated away report-to-report.
+        let px = flick_to_px(delta, &stick_settings[i].flick) + remainder[i];
+        let whole = px.trunc();
+        remainder[i] = px - whole;
+        dx_total = dx_total.saturating_add(whole as i32);
+    }
+    if dx_total != 0 {
+        kbm.push(KbmEvent::MouseMove {
+            dx: dx_total,
+            dy: 0,
+        });
+    }
+}
+
+/// Convert a flick-stick relative-aim turn (radians, from `StickState::flick_delta`) into a mouse-X
+/// pixel delta using the profile's [`FlickStick`](hyperion_core::stick::settings::FlickStick)
+/// calibration.
+///
+/// `real_world_calibration` is "degrees of in-game turn per full stick flick" (the DS4Windows /
+/// JoyShockMapper sense; default `360.0`). The stick pipeline's `flick_delta` is already an angular
+/// turn in radians, so pixels = `radians · (real_world_calibration / 360) · PX_PER_REVOLUTION`,
+/// i.e. the calibration scales the turn and a fixed pixels-per-360°-revolution constant maps the
+/// turn to mouse counts. The OneEuro smoothing (`min_cutoff`/`beta`) is the reserved on-hardware
+/// calibration hook (blueprint §14); until it is tuned this is the linear pass-through that keeps
+/// the wiring exercised. Centralized here so the scale has one tunable home.
+#[inline]
+fn flick_to_px(flick_delta_rad: f64, cfg: &hyperion_core::stick::settings::FlickStick) -> f64 {
+    /// Mouse counts per full 360° revolution. A neutral baseline (≈ the JoyShockMapper default
+    /// feel) reserved for on-hardware calibration; the relative-aim turn is small per report, so a
+    /// plain linear map keeps the sweep smooth without the M5 OneEuro filter.
+    const PX_PER_REVOLUTION: f64 = 2048.0;
+    let revolutions = flick_delta_rad / std::f64::consts::TAU;
+    revolutions * (cfg.real_world_calibration / 360.0) * PX_PER_REVOLUTION
 }
 
 /// Build the decoded [`ControllerState`] the mapping engine reads from a [`HotInput`] plus the
@@ -724,7 +868,13 @@ mod tests {
             (out.to_output_frame(), None)
         } else {
             let state = controller_state_from(input, filt_l, filt_r, lt, rt);
-            let (out, kbm) = apply(&state, &res.resolved, &mut res.map_state, 0);
+            let (out, mut kbm) = apply(&state, &res.resolved, &mut res.map_state, 0);
+            route_flick(
+                &res.stick_state,
+                &res.stick_settings,
+                &mut res.flick_remainder,
+                &mut kbm,
+            );
             (out.to_output_frame(), Some(kbm))
         }
     }
@@ -958,5 +1108,143 @@ mod tests {
         let mut b = PadButtons::default();
         b.set(PadButtons::A, true);
         assert_eq!(pack_xinput(b), XI_A);
+    }
+
+    // ----------------------------------- M5: flick-stick consumer --------------------------------
+
+    use hyperion_core::stick::settings::FlickStick;
+
+    /// Settings with flick enabled (and a known calibration) for the chosen stick index.
+    fn flick_settings(enabled: bool) -> StickSettings {
+        StickSettings {
+            flick: FlickStick {
+                enabled,
+                real_world_calibration: 360.0,
+                ..FlickStick::default()
+            },
+            ..StickSettings::default()
+        }
+    }
+
+    #[test]
+    fn flick_to_px_scales_revolution_by_calibration() {
+        // A full revolution (TAU rad) at 360°/flick maps to one revolution of pixels.
+        let cfg = FlickStick {
+            enabled: true,
+            real_world_calibration: 360.0,
+            ..FlickStick::default()
+        };
+        let px = flick_to_px(std::f64::consts::TAU, &cfg);
+        assert!(
+            (px - 2048.0).abs() < 1e-9,
+            "full turn -> one revolution of px"
+        );
+        // Doubling the calibration doubles the pixels for the same stick turn.
+        let cfg2 = FlickStick {
+            real_world_calibration: 720.0,
+            ..cfg
+        };
+        assert!((flick_to_px(std::f64::consts::TAU, &cfg2) - 4096.0).abs() < 1e-9);
+        // Sign is preserved (a negative turn aims the other way).
+        assert!(flick_to_px(-1.0, &cfg) < 0.0);
+    }
+
+    #[test]
+    fn route_flick_disabled_emits_nothing() {
+        // A non-zero flick_delta on a stick whose flick is DISABLED must not produce mouse motion
+        // (an unconfigured profile is byte-identical to M4).
+        let mut ss = [StickState::default(), StickState::default()];
+        ss[0].flick_delta = 1.0;
+        let settings = [flick_settings(false), flick_settings(false)];
+        let mut rem = [0.0; 2];
+        let mut kbm = hyperion_core::output::KbmBatch::new();
+        route_flick(&ss, &settings, &mut rem, &mut kbm);
+        assert!(kbm.is_empty(), "disabled flick emits no MouseMove");
+        assert_eq!(rem, [0.0, 0.0], "disabled flick keeps the carry at rest");
+    }
+
+    #[test]
+    fn route_flick_enabled_emits_horizontal_mousemove() {
+        // An enabled flick with a non-zero turn emits exactly one horizontal MouseMove (dy == 0).
+        let mut ss = [StickState::default(), StickState::default()];
+        ss[1].flick_delta = std::f64::consts::TAU; // a full turn on the right stick
+        let settings = [flick_settings(false), flick_settings(true)];
+        let mut rem = [0.0; 2];
+        let mut kbm = hyperion_core::output::KbmBatch::new();
+        route_flick(&ss, &settings, &mut rem, &mut kbm);
+        assert_eq!(
+            kbm.as_slice(),
+            &[KbmEvent::MouseMove { dx: 2048, dy: 0 }],
+            "one full-turn flick -> one horizontal mouse delta"
+        );
+    }
+
+    #[test]
+    fn route_flick_carries_sub_pixel_remainder() {
+        // A turn that scales to a fractional pixel emits 0 px the first time but carries the
+        // fraction; repeated reports eventually emit a whole pixel (no truncation loss).
+        let settings = [flick_settings(false), flick_settings(false)];
+        let mut settings = settings;
+        settings[0] = flick_settings(true);
+        let mut rem = [0.0; 2];
+
+        // Pick a delta whose pixel value is ~0.5 px/report.
+        let half_px_rad = (0.5 / 2048.0) * std::f64::consts::TAU;
+        let mut ss = [StickState::default(), StickState::default()];
+        ss[0].flick_delta = half_px_rad;
+
+        // First report: 0.5 px -> emits nothing, carries 0.5.
+        let mut kbm = hyperion_core::output::KbmBatch::new();
+        route_flick(&ss, &settings, &mut rem, &mut kbm);
+        assert!(kbm.is_empty(), "half a pixel emits nothing yet");
+        assert!((rem[0] - 0.5).abs() < 1e-9, "fraction carried");
+
+        // Second report: 0.5 + carried 0.5 == 1.0 px -> emits one pixel.
+        let mut kbm = hyperion_core::output::KbmBatch::new();
+        route_flick(&ss, &settings, &mut rem, &mut kbm);
+        assert_eq!(kbm.as_slice(), &[KbmEvent::MouseMove { dx: 1, dy: 0 }]);
+        assert!(rem[0].abs() < 1e-9, "carry consumed");
+    }
+
+    #[test]
+    fn route_flick_zero_delta_no_event() {
+        // Enabled flick but a centred stick (flick_delta == 0) emits nothing.
+        let ss = [StickState::default(), StickState::default()];
+        let settings = [flick_settings(true), flick_settings(true)];
+        let mut rem = [0.0; 2];
+        let mut kbm = hyperion_core::output::KbmBatch::new();
+        route_flick(&ss, &settings, &mut rem, &mut kbm);
+        assert!(kbm.is_empty());
+    }
+
+    #[test]
+    fn flick_enabled_profile_leaves_fast_path() {
+        // An all-passthrough profile with flick enabled on a stick must take the GENERAL path so
+        // `route_flick` can emit the mouse deltas (the fast path never builds a KbmBatch).
+        let p = hyperion_core::map::Profile {
+            rs: flick_settings(true),
+            ..hyperion_core::map::Profile::default()
+        };
+        let (_cfg, res) = resident_for(p);
+        assert!(
+            !res.passthrough_only,
+            "flick-enabled stick forces the general path despite identity bindings"
+        );
+
+        // Flick disabled (the default) stays on the fast path even with other stick stages on.
+        let (_cfg, res0) = resident_for(hyperion_core::map::Profile::default());
+        assert!(res0.passthrough_only, "no flick -> fast path preserved");
+    }
+
+    #[test]
+    fn reset_and_prime_clear_flick_remainder() {
+        // The sub-pixel carry must be part of the clean post-reset/prime state (verifier FIX 6).
+        let (_cfg, mut res) = resident_for(hyperion_core::map::Profile::default());
+        res.flick_remainder = [0.3, -0.7];
+        res.reset();
+        assert_eq!(res.flick_remainder, [0.0, 0.0], "reset clears flick carry");
+        res.flick_remainder = [0.2, 0.9];
+        res.prime();
+        assert_eq!(res.flick_remainder, [0.0, 0.0], "prime clears flick carry");
     }
 }

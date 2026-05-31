@@ -14,6 +14,7 @@
 //!
 //! No mid-chain quantization: raw int → f64 all the way to a single final i16 egress.
 
+pub mod autoswitch;
 pub mod axis;
 pub mod config;
 pub mod convert;

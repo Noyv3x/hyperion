@@ -12,14 +12,18 @@
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
+use crossbeam_channel::{Receiver, Sender};
 use hyperion_core::config::EngineConfig;
 
 use crate::config_store::ConfigStore;
-use crate::control::{ControlPlaneEvent, ControlPlaneRx, ControlPlaneTx};
+use crate::control::{
+    auto_switch_decision, ControlMsg, ControlPlaneEvent, ControlPlaneRx, ControlPlaneTx,
+};
 use crate::handoff::{self, CommandTx, ConfigHandle, KbmRx, KbmTx, TelemetryRx};
 use crate::hot::{HotThread, StopReason};
-use crate::win_io::{spawn_kbm_injector, DualSenseDevice, Vigem360Target};
+use crate::win_io::{spawn_kbm_injector, DualSenseDevice, DynPadTarget};
 
 // `EngineError` is shared with the cross-platform `Runtime`, so it lives in `crate::error`;
 // re-export it here so `engine::supervisor::EngineError` stays a valid path.
@@ -214,8 +218,10 @@ impl Supervisor {
             None => None,
         };
 
-        // TODO(M5): spawn the `ForegroundWatcher` (auto-profile-switch) on its own named thread
-        // here, with its own stop channel and a clone of `control_tx`, joined before the writer.
+        // The `ForegroundWatcher` (auto-profile-switch, §7.4) is spawned by `crate::runtime::Runtime`
+        // (not here): it needs a clone of the GUI→writer `ControlMsg` sender, which the runtime owns,
+        // and it must be joined **before** the config-writer thread in `Runtime::shutdown` so a final
+        // switch it emits is still drained. See `runtime::spawn_foreground_watcher` wiring.
 
         Ok(RunningSupervisor {
             handle,
@@ -346,7 +352,8 @@ fn spawn_control_plane_drain(rx: ControlPlaneRx) -> std::io::Result<JoinHandle<(
 ///    (`let _policy = ...;` — a bare statement would revert it one line later, verifier (c));
 /// 2. open the physical [`DualSenseDevice`] through HidHide (whitelist self → blacklist the
 ///    physical pad → cloak on); on device-not-found, return `DeviceLost` (headless, clean exit);
-/// 3. create + plug the [`Vigem360Target`] (`plugin` then `wait_ready`);
+/// 3. create + plug the [`DynPadTarget`] whose kind (X360 / DS4) is chosen from the active
+///    profile's `OutputKind` (`plugin` then `wait_ready`);
 /// 4. run [`HotThread::run`] to steady state.
 fn spawn_hot(
     cfg: EngineConfig,
@@ -374,8 +381,12 @@ fn spawn_hot(
                 return StopReason::DeviceLost;
             };
 
-            // (3) Create + plug the virtual Xbox 360 target and wait for OS enumeration.
-            let Some(target) = Vigem360Target::plugged() else {
+            // (3) Create + plug the virtual target whose kind (X360 / DS4) is chosen from the
+            // active profile's `OutputKind` at plug time (blueprint §6.3). The default profile is
+            // `PadTarget::X360`, so an unconfigured config plugs the byte-identical X360 pad. A
+            // runtime kind change replugs via `HotCommand::ReplugTarget` (handled in the hot loop).
+            let kind = crate::win_io::active_output_kind(&cfg);
+            let Some(target) = DynPadTarget::plugged(kind) else {
                 return StopReason::DeviceLost;
             };
 
@@ -389,4 +400,122 @@ fn spawn_hot(
         })
         .map_err(|e| EngineError::Platform(e.to_string()))?;
     Ok(handle)
+}
+
+/// A spawned [`ForegroundWatcher`] thread plus its dedicated stop signal, owned by
+/// [`crate::runtime::Runtime`].
+///
+/// The watcher is a low-priority polling thread (blueprint §7.4): it samples the foreground app
+/// ~`poll_hz` times a second and, on a change that matches an
+/// [`AutoSwitchRule`](hyperion_core::config::AutoSwitchRule), sends a
+/// [`ControlMsg::SetActiveProfile`] down the **same** single-writer `ControlMsg` channel the GUI
+/// uses — never the hot path. The runtime joins it **before** the config-writer thread in
+/// `shutdown()` so the writer is still alive to drain any final switch the watcher emitted.
+pub struct ForegroundWatcher {
+    stop_tx: Sender<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl ForegroundWatcher {
+    /// Signal the watcher to stop and join it. Idempotent; safe to call once.
+    pub fn shutdown(mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Spawn the `cfg(windows)` foreground auto-profile-switch watcher (blueprint §7.4, §12 M5).
+///
+/// A named, low-priority thread that, every `~1/poll_hz` seconds:
+/// 1. reads the foreground app via [`platform_win::foreground::foreground_app`] (a failed/elevated
+///    read yields `None` → no switch, never a crash),
+/// 2. skips work unless the `(exe, title)` changed since the last poll (so a steady foreground
+///    costs one cheap OS read and nothing else),
+/// 3. loads the live config snapshot and computes [`auto_switch_decision`] (the pure matcher),
+/// 4. on a match that differs from the current assignment, sends [`ControlMsg::SetActiveProfile`]
+///    through `control_tx` — the SAME path a GUI edit takes, so the single-writer guarantee holds
+///    and the hot loop sees only the resulting generation bump.
+///
+/// The poll rate is re-read from the live config each tick, so toggling `auto_switch.enabled` or
+/// `poll_hz` in the GUI takes effect without a respawn. The thread exits promptly on the stop
+/// signal (a `select` with a per-tick timeout, so shutdown never waits a whole poll interval).
+pub fn spawn_foreground_watcher(
+    config: ConfigHandle,
+    control_tx: Sender<ControlMsg>,
+) -> std::io::Result<ForegroundWatcher> {
+    // The watcher owns its own dedicated stop channel (1-slot, drop-on-full irrelevant — a single
+    // `()` is all `shutdown` ever sends). Returning the sender on the handle keeps the stop signal
+    // paired with the receiver the loop selects on.
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+    let join = std::thread::Builder::new()
+        .name("hyperion-foreground-watcher".to_string())
+        .spawn(move || foreground_watch_loop(&config, &control_tx, &stop_rx))?;
+    Ok(ForegroundWatcher {
+        stop_tx,
+        join: Some(join),
+    })
+}
+
+/// The watcher's poll loop body (blueprint §7.4). Pulled out so the thread closure stays small.
+///
+/// Dedupes on the last `(exe, title)` so a match is recomputed only when the foreground actually
+/// changes; the decision itself ([`auto_switch_decision`]) is the pure, Linux-tested matcher. This
+/// whole module is `cfg(windows)` (it drives ViGEm / HidHide), so the watcher always has a real
+/// `platform_win::foreground` to poll.
+fn foreground_watch_loop(
+    config: &ConfigHandle,
+    control_tx: &Sender<ControlMsg>,
+    stop_rx: &Receiver<()>,
+) {
+    let mut last: Option<(String, String)> = None;
+    loop {
+        // Re-read the poll interval from the live config each tick (clamped to a sane floor so a
+        // bad value can never spin the thread). Default 4 Hz.
+        let snapshot = config.load_full();
+        let poll_hz = snapshot.auto_switch.poll_hz.clamp(1, 60);
+        let interval = Duration::from_millis(1000 / u64::from(poll_hz));
+
+        // Block up to one interval for a stop signal; a real stop returns immediately.
+        match stop_rx.recv_timeout(interval) {
+            Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+        }
+
+        // Only the enabled gate does an OS read; a disabled watcher idles near-zero cost.
+        if !snapshot.auto_switch.enabled {
+            last = None; // forget the cached foreground so re-enabling re-evaluates immediately.
+            continue;
+        }
+
+        // Read the foreground app. `None` (no window / elevated-process read failure) keeps the
+        // current profile — the watcher just doesn't switch, never crashes.
+        let Some(app) = platform_win::foreground::foreground_app() else {
+            continue;
+        };
+
+        // Skip the match unless the foreground changed since the last successfully-handled read.
+        if last.as_ref().map(|(e, t)| (e.as_str(), t.as_str()))
+            == Some((app.exe.as_str(), app.title.as_str()))
+        {
+            continue;
+        }
+
+        // Pure decision against the live snapshot; on a real switch, send through the single writer.
+        match auto_switch_decision(&snapshot, &app.exe, &app.title) {
+            Some(msg) => {
+                // `try_send` is non-blocking. Only advance the dedupe cache when the switch is
+                // actually accepted; if the control queue is momentarily full (a burst of GUI edits
+                // in flight), leave `last` unchanged so the SAME foreground is re-evaluated and the
+                // switch retried on the next poll (self-healing, never blocks the writer).
+                if control_tx.try_send(msg).is_ok() {
+                    last = Some((app.exe, app.title));
+                }
+            }
+            // No switch needed for this foreground (no rule, or already-active profile). Cache it so
+            // we do not re-run the matcher every poll while it stays foreground.
+            None => last = Some((app.exe, app.title)),
+        }
+    }
 }

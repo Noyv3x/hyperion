@@ -57,6 +57,10 @@ struct WinRuntime {
     running: crate::supervisor::RunningSupervisor,
     /// Producer of [`crate::handoff::HotCommand::Shutdown`] to the hot loop.
     sup_tx: crate::handoff::CommandTx,
+    /// The foreground auto-profile-switch watcher (blueprint §7.4). Joined **before** the
+    /// config-writer thread in [`Runtime::shutdown`] so a final `SetActiveProfile` it sends is
+    /// still drained by the single writer.
+    foreground_watcher: crate::supervisor::ForegroundWatcher,
 }
 
 impl Runtime {
@@ -98,6 +102,15 @@ impl Runtime {
         let (writer_stop_tx, writer_stop_rx) = crossbeam_channel::bounded(1);
         let writer_join = spawn_control_writer(store, control_rx, writer_stop_rx);
 
+        // Spawn the foreground auto-profile-switch watcher (blueprint §7.4): a low-priority polling
+        // thread that sends `SetActiveProfile` through a clone of the SAME single-writer channel the
+        // GUI uses (the single-writer guarantee is intact — it is just another `ControlMsg` sender,
+        // never the hot path). It reads the live config snapshot to scope rules + dedupe; the hot
+        // loop picks up the resulting switch through the existing generation gate.
+        let foreground_watcher =
+            crate::supervisor::spawn_foreground_watcher(config.clone(), control_tx.clone())
+                .map_err(|e| EngineError::Platform(e.to_string()))?;
+
         // Spawn the hot thread last (NON-blocking); the running handle owns the timer-resolution
         // guard + join handle.
         let running = supervisor.spawn()?;
@@ -108,7 +121,11 @@ impl Runtime {
             writer_join: Some(writer_join),
             config,
             telemetry_rx,
-            win: Some(WinRuntime { running, sup_tx }),
+            win: Some(WinRuntime {
+                running,
+                sup_tx,
+                foreground_watcher,
+            }),
         })
     }
 
@@ -169,6 +186,10 @@ impl Runtime {
             // Ask the hot loop to stop, then join it (restores timer resolution on drop).
             let _ = win.sup_tx.send(crate::handoff::HotCommand::Shutdown);
             let _ = win.running.join();
+            // Stop the foreground watcher BEFORE the writer below: it must emit no further
+            // `SetActiveProfile` once we tear down, and any switch already in flight is still
+            // drained because the writer thread is stopped only after this returns.
+            win.foreground_watcher.shutdown();
         }
 
         // Stop the control-writer thread even though `self.control_tx` (and GUI clones) may still

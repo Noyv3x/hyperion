@@ -24,13 +24,57 @@
 //! * **Macro**: `Macro(id)` → on/off edge → [`KbmEvent::Macro`].
 //! * **Special**: `Special(id)` → edge → [`KbmEvent::Special`] (drained by the control plane).
 //! * **`GamepadAxis` / `TouchpadClick`**: digital→axis push and the touchpad output bit.
+//!
+//! ## M5 additions (blueprint §12 M5)
+//! * **Gyro→mouse scaling**: `MouseMove(MouseMoveSrc::Gyro)` now drives `ms.gyro_mouse` through the
+//!   full DS4Windows velocity model via [`MouseAccumulator::gyro_velocity_step`], using the resolved
+//!   [`GyroAccumCfg`](crate::mouse_accum::GyroAccumCfg) from `rp.gyro.to_accum_cfg()` (M4 passed raw
+//!   rad/s through the carry-only path; M5 scales it). The profile's
+//!   [`GyroMode`](crate::map::profile::GyroMode) gates the feed (`Off` keeps it inert) and
+//!   `swap_yaw_roll` selects the horizontal axis.
+//! * **Mouse-from-stick** now reads the resolved `rp.mouse` (M4 used the default), still
+//!   byte-identical for an unconfigured profile.
+//!
+//! ## FLICK-STICK CONSUMER CONTRACT (for the engine/hot-loop integration agent — blueprint §4
+//! stage 9, §12 M5)
+//!
+//! The resolved **stick pipeline** (`stick::pipeline::process_stick`) runs in the engine
+//! (`hot.rs`), NOT inside [`apply`]. Its terminal stage 9 stashes the per-report relative-aim turn
+//! in `StickState::flick_delta` (`f64`, the absolute stick is returned unchanged). `apply()` has no
+//! access to that pipeline state, so the **engine routes the flick delta into the mouse output**,
+//! not `apply()`. The chosen contract (cleanest of the two options — the engine adds it post-apply,
+//! so [`apply`]'s pure signature is untouched and the stick pipeline stays the sole owner of flick
+//! state):
+//!
+//! 1. After `process_stick` for each stick, the engine holds `flick_dx = stick_state[i].flick_delta`
+//!    (LS and RS each have their own; sum or pick per the active flick binding — typically only one
+//!    stick has flick enabled).
+//! 2. After `let (out, mut kbm) = apply(&state, rp, &mut map_state, now_us);`, the engine converts
+//!    the flick delta to an integer mouse-X delta and **merges it into the same `KbmBatch`**:
+//!    `if flick_dx != 0.0 { let dx = flick_to_px(flick_dx); if dx != 0 { kbm.push(KbmEvent::MouseMove { dx, dy: 0 }); } }`
+//!    (flick is a horizontal turn; `dy` stays 0). Use a dedicated remainder carry in `MapState`
+//!    (e.g. reuse `ms.gyro_mouse` is NOT correct — add a small `flick_remainder: f64` field if
+//!    sub-pixel carry is wanted; the flick delta is already a large turn so a plain
+//!    `round()`/`trunc()` is acceptable for M5, documented as a follow-up to add carry).
+//! 3. The `flick_to_px` scale is the reserved OneEuro/real-world-calibration contract (blueprint
+//!    §14): `flick_delta` is the relative turn in the stick pipeline's angular unit; multiply by the
+//!    profile's flick sensitivity (a `StickSettings::flick` field) to get pixels. Until that scale is
+//!    tuned on hardware, a 1:1 pass-through (`dx = flick_delta.round() as i32`) keeps the wiring
+//!    exercised. The mouse-move event is the SAME `KbmEvent::MouseMove` variant the stick/gyro path
+//!    emits, so the KBM injector needs no new event type.
+//!
+//! Rationale for "engine adds it post-apply" over "apply() accepts the flick delta": `apply()` is
+//! the pure, alloc-free remap of a `ControllerState`; the flick delta is a *derived stick-pipeline
+//! output*, not a raw control. Threading it through `apply()` would couple the pure engine to the
+//! stick pipeline's resident state. Merging into the returned `KbmBatch` keeps `apply()`'s signature
+//! and every M3/M4 golden untouched while still funnelling all mouse motion through one batch.
 
 use crate::input::{Control, ControlKind, ControllerState};
 use crate::map::binding::{
     AxisDir, BindTarget, BindingSlot, GamepadAxis, KeyKind, MouseMoveSrc, TurboCfg, WheelDir,
 };
 use crate::map::profile::ResolvedProfile;
-use crate::mouse_accum::MouseAccumCfg;
+use crate::mouse_accum::{GyroAccumCfg, MouseAccumCfg};
 use crate::output::{KbmBatch, KbmEvent, KeyKind as InjectKind, MouseButton, OutputState};
 
 /// Re-export the real [`MouseAccumulator`](crate::mouse_accum::MouseAccumulator) so the historical
@@ -307,14 +351,36 @@ fn resolve_gamepad_axis(
     }
 }
 
+/// The per-report mouse-move tunables resolved once from the profile (kept as a small `Copy` bundle
+/// so [`resolve_mouse_move`] stays under the argument-count limit and the cfgs are computed once per
+/// `apply`, not per `MouseMove`-bound control).
+#[derive(Clone, Copy)]
+struct MouseMoveCfg {
+    /// Stick→mouse tunables.
+    stick: MouseAccumCfg,
+    /// Gyro→mouse velocity-model tunables.
+    gyro: GyroAccumCfg,
+    /// Read roll instead of yaw for the gyro horizontal axis.
+    swap_yaw_roll: bool,
+}
+
 /// Resolve a mouse-move binding: feed the resident [`MouseAccumulator`] from the named source's
-/// signed stick deflection (or gyro rate) and push the integer `(dx, dy)` as a [`KbmEvent::MouseMove`]
-/// (verifier FIX 7). Emits nothing when the delta is `(0, 0)` so the batch stays sparse.
+/// signed stick deflection (or scaled gyro rate) and push the integer `(dx, dy)` as a
+/// [`KbmEvent::MouseMove`] (verifier FIX 7). Emits nothing when the delta is `(0, 0)` so the batch
+/// stays sparse.
+///
+/// **M5 gyro scaling.** The `Gyro` source now runs the full DS4Windows velocity model
+/// ([`MouseAccumulator::gyro_velocity_step`]) using the resolved [`GyroAccumCfg`] from the profile's
+/// [`GyroSettings`](crate::map::profile::GyroSettings) — sensitivity, rate-domain dead-zone,
+/// vertical-scale, jitter compensation, and invert. The horizontal axis is yaw (or roll when
+/// `swap_yaw_roll` is set), and the vertical channel is `-pitch` so a nose-up tilt looks up. The
+/// caller (`apply`) is responsible for the activation gate ([`GyroMode`](crate::map::profile::GyroMode));
+/// this routine only runs when the gyro feed is active.
 #[inline]
 fn resolve_mouse_move(
     src: MouseMoveSrc,
     state: &ControllerState,
-    cfg: &MouseAccumCfg,
+    cfg: &MouseMoveCfg,
     elapsed_s: f64,
     ms: &mut MapState,
     batch: &mut KbmBatch,
@@ -322,19 +388,22 @@ fn resolve_mouse_move(
     let (dx, dy) = match src {
         MouseMoveSrc::LeftStick => ms
             .stick_mouse
-            .stick_step(state.lx, state.ly, elapsed_s, cfg),
+            .stick_step(state.lx, state.ly, elapsed_s, &cfg.stick),
         MouseMoveSrc::RightStick => ms
             .stick_mouse
-            .stick_step(state.rx, state.ry, elapsed_s, cfg),
+            .stick_step(state.rx, state.ry, elapsed_s, &cfg.stick),
         MouseMoveSrc::Gyro => {
-            // Gyro yaw → dx, pitch → dy (the M5 scaling owner lives in the gyro settings; here we
-            // pass the raw rad/s rate through the same carry path so the wiring is exercised).
-            ms.gyro_mouse.gyro_step(
-                state.motion.gyro_yaw,
-                state.motion.gyro_pitch,
-                elapsed_s,
-                cfg,
-            )
+            // Horizontal: yaw, or roll when the axis is swapped (DS4Windows getGyroMouseHorizontalAxis).
+            // Vertical: -pitch (C# `deltaY = -gyroPitch`) so nose-up looks up. The GyroAccumCfg owns
+            // the M5 velocity scaling, rate-domain dead-zone, vertical-scale, jitter, and invert.
+            let gx = if cfg.swap_yaw_roll {
+                state.motion.gyro_roll
+            } else {
+                state.motion.gyro_yaw
+            };
+            let gz = -state.motion.gyro_pitch;
+            ms.gyro_mouse
+                .gyro_velocity_step(gx, gz, elapsed_s, &cfg.gyro)
         }
         MouseMoveSrc::Unknown => (0, 0),
     };
@@ -387,16 +456,21 @@ fn resolve_mouse_wheel(
     }
 }
 
-/// Resolve the mouse settings carried by the resolved profile into the accumulator's tunable form.
-///
-/// **Integration note (blueprint §3/§7):** `ResolvedProfile` does not yet carry a resolved
-/// `mouse: MouseSettings` field — `profile.rs` (owned by the integration agent) holds an empty
-/// `MouseSettings {}` placeholder. Until that field + its `MouseSettings → MouseAccumCfg`
-/// projection land, `apply()` uses [`MouseAccumCfg::default`] (DS4Windows-class defaults). When the
-/// field is added, replace this with `rp.mouse.to_accum_cfg()` (or read the individual tunables).
+/// Resolve the mouse-from-stick settings carried by the resolved profile into the accumulator's
+/// tunable form. For a default (unconfigured) profile this equals [`MouseAccumCfg::default`]
+/// (pinned by `profile::tests::mouse_settings_default_matches_accum_default`), so the M4 mouse
+/// goldens stay byte-identical.
 #[inline]
-fn mouse_cfg(_rp: &ResolvedProfile) -> MouseAccumCfg {
-    MouseAccumCfg::default()
+fn mouse_cfg(rp: &ResolvedProfile) -> MouseAccumCfg {
+    rp.mouse.to_accum_cfg()
+}
+
+/// Resolve the gyro→mouse settings carried by the resolved profile into the gyro accumulator's
+/// tunable form (M5). The activation mode + horizontal-axis swap are read separately by `apply()`;
+/// this carries only the velocity-model tunables.
+#[inline]
+fn gyro_cfg(rp: &ResolvedProfile) -> GyroAccumCfg {
+    rp.gyro.to_accum_cfg()
 }
 
 /// Pure, alloc-free, no-I/O remap entry point (blueprint §5).
@@ -452,7 +526,16 @@ pub fn apply(
     // --- Step 4: per-control resolve. -----------------------------------------------------------
     let mut out = OutputState::default();
     let mut batch = KbmBatch::new();
-    let mcfg = mouse_cfg(rp);
+    let mmcfg = MouseMoveCfg {
+        stick: mouse_cfg(rp),
+        gyro: gyro_cfg(rp),
+        swap_yaw_roll: rp.gyro.swap_yaw_roll,
+    };
+    // Gyro→mouse activation (M5): when `GyroMode::Off` (the default) the gyro feed is fully inert no
+    // matter what is bound, so a non-gyro profile never produces gyro motion. The per-control `on`
+    // (a bound control, shift trigger, or always-on control) is the TriggerHeld signal; `AlwaysOn`
+    // ignores it.
+    let gyro_mode = rp.gyro.mode;
 
     for c in Control::ALL {
         let idx = c.as_index();
@@ -495,9 +578,16 @@ pub fn apply(
             }
             BindTarget::MouseMove(src) => {
                 // Mouse-move runs continuously while gated on (no edge): the accumulator owns the
-                // sub-pixel carry. Only feed it while `on` so a turbo/shift gate can pulse it.
-                if on {
-                    resolve_mouse_move(src, state, &mcfg, elapsed_s, ms, &mut batch);
+                // sub-pixel carry. Only feed it while `on` so a turbo/shift gate can pulse it. The
+                // Gyro source additionally requires the profile's gyro mode to be active (`on` is
+                // the TriggerHeld signal); `Off` keeps the gyro path inert.
+                let feed = on
+                    && match src {
+                        MouseMoveSrc::Gyro => gyro_mode.is_active(on),
+                        _ => true,
+                    };
+                if feed {
+                    resolve_mouse_move(src, state, &mmcfg, elapsed_s, ms, &mut batch);
                 }
             }
             BindTarget::MouseWheel(dir) => {
@@ -1475,5 +1565,233 @@ mod tests {
         };
         let (out, _) = apply(&left_shift, &rp, &mut ms, 1);
         assert_eq!(out.lx, 0.0, "shifted half remaps -> both halves neutral");
+    }
+
+    // ------------------------------------ M5: gyro→mouse -----------------------------------------
+
+    use crate::input::Motion;
+    use crate::map::profile::{GyroMode, GyroSettings};
+
+    /// Build a profile binding `GyroZPos` (a gyro direction control) to `MouseMove(Gyro)` with the
+    /// given gyro settings. `GyroZPos` is digitized active when the yaw rate exceeds `gyro_dir`, so a
+    /// rightward yaw turns the control `on` and the gyro feed runs.
+    fn rp_gyro(gyro: GyroSettings) -> ResolvedProfile {
+        let mut p = Profile {
+            gyro,
+            ..Profile::default()
+        };
+        p.bindings.insert(
+            Control::GyroZPos,
+            BindingSlot::from_bind(BindTarget::MouseMove(MouseMoveSrc::Gyro)),
+        );
+        p.resolve()
+    }
+
+    fn yaw_state(rate: f64) -> ControllerState {
+        ControllerState {
+            motion: Motion {
+                gyro_yaw: rate,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gyro_mode_off_is_inert() {
+        // Default gyro mode is Off: even with a strong yaw and a MouseMove(Gyro) binding, no motion.
+        let rp = rp_gyro(GyroSettings::default());
+        let mut ms = MapState::default();
+        let st = yaw_state(5.0); // well past the gyro_dir threshold
+        let _ = apply(&st, &rp, &mut ms, 1_000);
+        let (_, b) = apply(&st, &rp, &mut ms, 6_000);
+        assert!(
+            b.as_slice()
+                .iter()
+                .all(|e| !matches!(e, KbmEvent::MouseMove { .. })),
+            "GyroMode::Off must emit no gyro mouse motion"
+        );
+    }
+
+    #[test]
+    fn gyro_always_on_scales_and_moves_right() {
+        // AlwaysOn + a rightward yaw -> a positive dx mouse move once the velocity model + carry
+        // cross a pixel. Use a high sensitivity so it lands within a few reports.
+        let rp = rp_gyro(GyroSettings {
+            mode: GyroMode::AlwaysOn,
+            sensitivity: 80.0,
+            deadzone: 0.0,
+            jitter_comp: false,
+            ..GyroSettings::default()
+        });
+        let mut ms = MapState::default();
+        let st = yaw_state(5.0);
+        let _ = apply(&st, &rp, &mut ms, 1_000); // prime prev_now_us (dt 0)
+
+        let mut saw_right = false;
+        let mut t = 6_000u64;
+        for _ in 0..8 {
+            let (_, b) = apply(&st, &rp, &mut ms, t);
+            for e in b.as_slice() {
+                if let KbmEvent::MouseMove { dx, dy } = e {
+                    assert!(*dx > 0, "rightward yaw -> dx>0, got {dx}");
+                    assert_eq!(*dy, 0, "pure yaw -> no vertical, got {dy}");
+                    saw_right = true;
+                }
+            }
+            t += 5_000;
+        }
+        assert!(
+            saw_right,
+            "AlwaysOn gyro yaw eventually emits a rightward MouseMove"
+        );
+    }
+
+    #[test]
+    fn gyro_invert_x_flips_direction() {
+        let base = GyroSettings {
+            mode: GyroMode::AlwaysOn,
+            sensitivity: 80.0,
+            deadzone: 0.0,
+            jitter_comp: false,
+            ..GyroSettings::default()
+        };
+        let inv = GyroSettings {
+            invert_x: true,
+            ..base
+        };
+        let drive = |rp: &ResolvedProfile| -> i32 {
+            let mut ms = MapState::default();
+            let st = yaw_state(5.0);
+            let _ = apply(&st, rp, &mut ms, 1_000);
+            let mut sum = 0;
+            let mut t = 6_000u64;
+            for _ in 0..8 {
+                let (_, b) = apply(&st, rp, &mut ms, t);
+                for e in b.as_slice() {
+                    if let KbmEvent::MouseMove { dx, .. } = e {
+                        sum += *dx;
+                    }
+                }
+                t += 5_000;
+            }
+            sum
+        };
+        let normal = drive(&rp_gyro(base));
+        let inverted = drive(&rp_gyro(inv));
+        assert!(normal > 0, "normal yaw moves right");
+        assert!(inverted < 0, "invert_x flips it left, got {inverted}");
+    }
+
+    #[test]
+    fn gyro_pitch_up_moves_screen_up() {
+        // A nose-up pitch (positive gyro_pitch) must move the cursor UP on screen (negative dy),
+        // since apply() feeds gyro_z = -pitch. Bind GyroXNeg (pitch-down direction) is not active
+        // here; we bind via an always-on control so the feed runs regardless of the gyro direction
+        // digitization. Use a Passthrough+shift trick: bind a face button to MouseMove(Gyro).
+        let mut p = Profile {
+            gyro: GyroSettings {
+                mode: GyroMode::AlwaysOn,
+                sensitivity: 80.0,
+                deadzone: 0.0,
+                jitter_comp: false,
+                ..GyroSettings::default()
+            },
+            ..Profile::default()
+        };
+        // Cross held -> on -> gyro feed runs every report (AlwaysOn ignores the trigger anyway).
+        p.bindings.insert(
+            Control::Cross,
+            BindingSlot::from_bind(BindTarget::MouseMove(MouseMoveSrc::Gyro)),
+        );
+        let rp = p.resolve();
+        let mut ms = MapState::default();
+        let st = ControllerState {
+            cross: true,
+            motion: Motion {
+                gyro_pitch: 5.0, // nose up
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _ = apply(&st, &rp, &mut ms, 1_000);
+        let mut saw_up = false;
+        let mut t = 6_000u64;
+        for _ in 0..8 {
+            let (_, b) = apply(&st, &rp, &mut ms, t);
+            for e in b.as_slice() {
+                if let KbmEvent::MouseMove { dx, dy } = e {
+                    assert_eq!(*dx, 0, "pure pitch -> no horizontal, got {dx}");
+                    assert!(*dy < 0, "nose-up pitch -> screen up (dy<0), got {dy}");
+                    saw_up = true;
+                }
+            }
+            t += 5_000;
+        }
+        assert!(
+            saw_up,
+            "AlwaysOn gyro pitch-up eventually emits an upward MouseMove"
+        );
+    }
+
+    #[test]
+    fn gyro_swap_yaw_roll_uses_roll_for_horizontal() {
+        // With swap_yaw_roll, the horizontal channel reads roll, not yaw. A pure-roll sample then
+        // produces horizontal motion; a pure-yaw sample produces none.
+        let rp = rp_gyro(GyroSettings {
+            mode: GyroMode::AlwaysOn,
+            sensitivity: 80.0,
+            deadzone: 0.0,
+            jitter_comp: false,
+            swap_yaw_roll: true,
+            ..GyroSettings::default()
+        });
+        // Note: rp_gyro binds GyroZPos (yaw-based digitization). With swap on, the horizontal feed
+        // reads roll, but the BINDING activation still uses yaw. So drive BOTH a yaw (to activate the
+        // control) and a roll (to produce horizontal motion).
+        let mut ms = MapState::default();
+        let st = ControllerState {
+            motion: Motion {
+                gyro_yaw: 5.0,  // activates GyroZPos
+                gyro_roll: 5.0, // drives the (swapped) horizontal channel
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _ = apply(&st, &rp, &mut ms, 1_000);
+        let mut saw = false;
+        let mut t = 6_000u64;
+        for _ in 0..8 {
+            let (_, b) = apply(&st, &rp, &mut ms, t);
+            for e in b.as_slice() {
+                if let KbmEvent::MouseMove { dx, .. } = e {
+                    assert!(*dx > 0, "roll drives horizontal when swapped, got {dx}");
+                    saw = true;
+                }
+            }
+            t += 5_000;
+        }
+        assert!(saw, "swapped horizontal axis reads roll");
+    }
+
+    #[test]
+    fn default_profile_gyro_emits_nothing_passthrough_unchanged() {
+        // Sanity: a fully default profile (no gyro binding, gyro Off) with a strong gyro sample is
+        // still byte-identical passthrough — no gyro leak into the output.
+        let rp = ResolvedProfile::default();
+        let mut ms = MapState::default();
+        let st = ControllerState {
+            motion: Motion {
+                gyro_yaw: 9.0,
+                gyro_pitch: 9.0,
+                gyro_roll: 9.0,
+                ..Default::default()
+            },
+            lx: 0.3,
+            ..Default::default()
+        };
+        let (out, b) = apply(&st, &rp, &mut ms, 1_000);
+        assert_eq!(out, OutputState::passthrough(&st));
+        assert!(b.is_empty(), "no gyro binding -> no KBM events");
     }
 }

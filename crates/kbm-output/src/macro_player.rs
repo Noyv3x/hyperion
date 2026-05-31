@@ -45,6 +45,10 @@ pub use hyperion_core::map::profile::{MacroDef, MacroMouseButton, MacroStep};
 
 use crate::{KbmSink, SendInputKbm};
 
+/// Minimum delay (ms) between consecutive passes of a `repeat` macro whose tail scheduled no
+/// `Wait`. Bounds a wait-less repeat to ~1 kHz instead of busy-looping the injector thread.
+const MACRO_MIN_REPEAT_MS: u64 = 1;
+
 /// Maximum number of distinct keys/buttons one running macro can hold at once, for the
 /// end-of-macro release sweep. A macro pressing more than this many *distinct* keys without
 /// releasing them is pathological; extra holds are still injected, only the auto-release sweep is
@@ -230,8 +234,14 @@ impl MacroPlayer {
                 // Reached the end. A `repeat` macro still triggered restarts from the top; otherwise
                 // finish (releasing any keys still held).
                 if self.macros[def_idx].repeat && self.running[idx].triggered {
+                    // Restart the pass, but NEVER within this same tick. A repeat macro whose pass
+                    // from the resume point to the end scheduled no `Wait` would otherwise spin
+                    // forever here (busy-looping the injector thread, and hanging tests). Impose a
+                    // minimum inter-pass delay so the injector re-ticks and runs the next pass then.
                     self.running[idx].step = 0;
-                    continue;
+                    self.running[idx].wait_until =
+                        Some(now + Duration::from_millis(MACRO_MIN_REPEAT_MS));
+                    return false;
                 }
                 self.stop_at(sink, idx);
                 return true;

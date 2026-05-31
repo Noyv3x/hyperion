@@ -1,49 +1,214 @@
-# Hyperion config — placed next to hyperion.exe. The egui GUI edits this live
-# (Save writes it back); you can also hand-edit it. Values are clamped on load.
-
-# Which [devices.*] profile is active.
 active_device = "dse_primary"
 
 [thread]
-# hot_core / gui_core: pin threads to physical cores (omit = auto; avoid SMT siblings).
-# hot_core = 2
-# gui_core = 4
-timer_resolution_us = 500       # NtSetTimerResolution target (0.5 ms)
-use_mmcss = true                # MMCSS "Pro Audio" boost on the hot thread
+timer_resolution_us = 500
+use_mmcss = true
 mmcss_task = "Pro Audio"
-wait_mode = "HybridSpin"        # "Blocking" (lowest CPU) | "HybridSpin" (lowest latency)
-spin_budget_us = 80             # HybridSpin: spin this long before a real blocking wait
-skip_duplicate_reports = false  # skip byte-identical duplicate reports (fake-4K)
-dt_source = "QpcOnly"           # "QpcOnly" (safe default) | "DeviceTimestamp" (after HW calibration)
+wait_mode = "HybridSpin"
+spin_budget_us = 80
+skip_duplicate_reports = false
+dt_source = "QpcOnly"
 
 [hidhide]
-enabled = true                  # hide the physical pad so the game sees only the virtual one
-use_cli = true                  # use HidHideCLI.exe (the working path); IOCTL path is WIP
+enabled = true
+use_cli = false
 cli_path = 'C:\Program Files\Nefarius Software Solutions\HidHide\x64\HidHideCLI.exe'
 
-# ---- Device profile: DualSense Edge over USB (PID 0x0DF2; base DualSense = 0x0CE6) ----
 [devices.dse_primary]
-vid = 0x054C
-pid = 0x0DF2
+vid = 1356
+pid = 3570
 report_rate_hz = 4000
 stick_bits = 8
 
-[devices.dse_primary.ls]
-mode = "Rc"                     # "None" | "Rc"
-[devices.dse_primary.ls.rc]
-enabled = true
-mode = "UltimateDt"             # "FireBirdInteger" | "UltimateLegacy" | "UltimateDt" (default)
-use_dynamic_curve = false
-period_us = 4000                # [1000, 8000]; a TRUE time constant in UltimateDt
-fixed_param = 100               # [-500, 500]; >0 smooth/low-pass, <0 lead/fast-follow, 0 bypass
-curve = { y0 = 100, x1 = 32, y1 = 100, x2 = 96, y2 = 100, y3 = 100 }
+[profiles.default]
+name = "default"
+output_kind = "X360"
+macros = []
+specials = []
 
-[devices.dse_primary.rs]
-mode = "Rc"
-[devices.dse_primary.rs.rc]
-enabled = true
+[profiles.default.bindings]
+
+[profiles.default.ls]
+rc_mode_on = false
+sensitivity = 1.0
+curve = "Linear"
+
+[profiles.default.ls.rc]
+enabled = false
 mode = "UltimateDt"
 use_dynamic_curve = false
 period_us = 4000
 fixed_param = 100
-curve = { y0 = 100, x1 = 32, y1 = 100, x2 = 96, y2 = 100, y3 = 100 }
+
+[profiles.default.ls.rc.curve]
+y0 = 100
+x1 = 32
+y1 = 100
+x2 = 96
+y2 = 100
+y3 = 100
+
+[profiles.default.ls.rotation]
+angle_rad = 0.0
+
+[profiles.default.ls.anti_snapback]
+enabled = false
+delta = 135.0
+timeout_ms = 50
+
+[profiles.default.ls.dead_zone]
+type = "Radial"
+dead_zone = 0
+anti_dead_zone = 0
+max_zone = 100
+max_output = 100.0
+max_output_force = false
+fuzz = 0
+vertical_scale = 100.0
+
+[profiles.default.ls.dead_zone.x_axis]
+dead_zone = 0
+anti_dead_zone = 0
+max_zone = 100
+max_output = 100.0
+
+[profiles.default.ls.dead_zone.y_axis]
+dead_zone = 0
+anti_dead_zone = 0
+max_zone = 100
+max_output = 100.0
+
+[profiles.default.ls.square]
+enabled = false
+roundness = 5.0
+
+[profiles.default.ls.flick]
+enabled = false
+real_world_calibration = 360.0
+min_cutoff = 1.0
+beta = 0.7
+
+[profiles.default.rs]
+rc_mode_on = false
+sensitivity = 1.0
+curve = "Linear"
+
+[profiles.default.rs.rc]
+enabled = false
+mode = "UltimateDt"
+use_dynamic_curve = false
+period_us = 4000
+fixed_param = 100
+
+[profiles.default.rs.rc.curve]
+y0 = 100
+x1 = 32
+y1 = 100
+x2 = 96
+y2 = 100
+y3 = 100
+
+[profiles.default.rs.rotation]
+angle_rad = 0.0
+
+[profiles.default.rs.anti_snapback]
+enabled = false
+delta = 135.0
+timeout_ms = 50
+
+[profiles.default.rs.dead_zone]
+type = "Radial"
+dead_zone = 0
+anti_dead_zone = 0
+max_zone = 100
+max_output = 100.0
+max_output_force = false
+fuzz = 0
+vertical_scale = 100.0
+
+[profiles.default.rs.dead_zone.x_axis]
+dead_zone = 0
+anti_dead_zone = 0
+max_zone = 100
+max_output = 100.0
+
+[profiles.default.rs.dead_zone.y_axis]
+dead_zone = 0
+anti_dead_zone = 0
+max_zone = 100
+max_output = 100.0
+
+[profiles.default.rs.square]
+enabled = false
+roundness = 5.0
+
+[profiles.default.rs.flick]
+enabled = false
+real_world_calibration = 360.0
+min_cutoff = 1.0
+beta = 0.7
+
+[profiles.default.l2]
+dead_zone = 0
+anti_dead_zone = 0
+max_zone = 100
+max_output = 100.0
+sensitivity = 1.0
+curve = "Linear"
+button_threshold = 100
+mode = "Normal"
+soft_threshold = 0
+hip_fire_us = 100000
+
+[profiles.default.r2]
+dead_zone = 0
+anti_dead_zone = 0
+max_zone = 100
+max_output = 100.0
+sensitivity = 1.0
+curve = "Linear"
+button_threshold = 100
+mode = "Normal"
+soft_threshold = 0
+hip_fire_us = 100000
+
+[profiles.default.mouse]
+sensitivity = 25.0
+vertical_scale = 1.0
+velocity_offset = 0.012
+deadzone = 0.0
+min_threshold = 1.0
+accelerate = false
+accel_power = 1.0
+invert_x = false
+invert_y = false
+
+[profiles.default.gyro]
+mode = "Off"
+sensitivity = 1.0
+vertical_scale = 1.0
+deadzone = 10.0
+velocity_offset = 0.16
+min_threshold = 1.0
+jitter_comp = true
+invert_x = false
+invert_y = false
+swap_yaw_roll = false
+
+[profiles.default.touchpad]
+as_mouse = false
+as_buttons = true
+sensitivity = 1.0
+velocity_offset = 0.015
+min_threshold = 1.0
+jitter_comp = true
+invert_x = false
+invert_y = false
+
+[assignments]
+dse_primary = "default"
+
+[auto_switch]
+enabled = false
+poll_hz = 4
+rules = []

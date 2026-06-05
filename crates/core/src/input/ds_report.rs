@@ -214,8 +214,6 @@ const EDGE_FN_R: u8 = 0x20;
 const EDGE_BLP: u8 = 0x40;
 /// Back-right paddle bit.
 const EDGE_BRP: u8 = 0x80;
-/// Capture (Create-extra) bit, riding `btn2` alongside PS/Touch (`buf[7] & 0x04`).
-const EDGE_CAPTURE: u8 = 0x04;
 
 /// The decoded DualSense-Edge superset (Mute/Capture + Fn/paddle/side), all `false` unless the
 /// source is Edge-capable. HW-verify (M6): see the module-level Edge note.
@@ -237,14 +235,18 @@ struct EdgeBits {
 /// the decode is purely additive over M5. Side buttons (`side_l`/`side_r`) have no published stable
 /// bit in this tail and stay `false` pending a hardware capture (documented for the maintainer).
 #[inline]
-fn decode_edge_bits(r: &DsReport, buf: &[u8], is_edge: bool) -> EdgeBits {
+fn decode_edge_bits(buf: &[u8], is_edge: bool) -> EdgeBits {
     if !is_edge || buf.len() <= EDGE_FN_BYTE {
         return EdgeBits::default();
     }
     let fb = buf[EDGE_FN_BYTE];
     EdgeBits {
         mute: fb & EDGE_MUTE != 0,
-        capture: r.btn2 & EDGE_CAPTURE != 0,
+        // HW-verify: the real DualSense Mute/Create-extra ("Capture") bit is unknown. The previous
+        // `btn2 & 0x04` decode COLLIDED with the frame-counter LSB (`counter = buf[7] >> 2` uses
+        // bits 2..7), so it falsely fired every other report. Kept inert until a hardware capture,
+        // exactly like `side_l`/`side_r`.
+        capture: false,
         fn_l: fb & EDGE_FN_L != 0,
         fn_r: fb & EDGE_FN_R != 0,
         blp: fb & EDGE_BLP != 0,
@@ -278,7 +280,7 @@ pub fn decode_controller_state(r: &DsReport, buf: &[u8], meta: &SourceMeta) -> C
     // The Edge superset (Mute/Capture, Fn/paddle/side) is decoded only for Edge-capable sources
     // from the extended report tail (HW-verify); a non-Edge source reads every gated field `false`,
     // so this is byte-identical to M5 for the common DS4-compat path.
-    let edge = decode_edge_bits(r, buf, meta.is_edge);
+    let edge = decode_edge_bits(buf, meta.is_edge);
     // Touch contacts from the report tail (offsets 35..=42, HW-verify); two inactive `Default`
     // contacts for any buffer that does not reach the tail (M5 behavior preserved).
     let touch = decode_touch(buf);
@@ -632,8 +634,10 @@ mod tests {
 
     #[test]
     fn edge_bits_decode_only_when_edge_capable() {
-        // Set every Fn/paddle/Mute bit in the extended byte + the Capture bit in btn2.
-        let mut b = synth_btn(8, 0, EDGE_CAPTURE);
+        // Set every Fn/paddle/Mute bit in the extended byte. (Capture is inert pending a hardware
+        // capture — its old `btn2 & 0x04` decode collided with the frame-counter LSB, so it is no
+        // longer read from btn2.)
+        let mut b = synth_btn(8, 0, 0);
         b[EDGE_FN_BYTE] = EDGE_MUTE | EDGE_FN_L | EDGE_FN_R | EDGE_BLP | EDGE_BRP;
 
         // Non-Edge source: every gated field stays false (byte-identical to M5).
@@ -641,10 +645,13 @@ mod tests {
         assert!(!non_edge.mute && !non_edge.capture && !non_edge.fn_l && !non_edge.fn_r);
         assert!(!non_edge.blp && !non_edge.brp);
 
-        // Edge source: the bits decode.
+        // Edge source: the extended-byte bits decode; capture/side stay inert (HW-verify).
         let edge = decode_edge(&b);
-        assert!(edge.mute && edge.capture && edge.fn_l && edge.fn_r && edge.blp && edge.brp);
-        // Side buttons remain inert (no published bit — HW-verify follow-up).
+        assert!(edge.mute && edge.fn_l && edge.fn_r && edge.blp && edge.brp);
+        assert!(
+            !edge.capture,
+            "capture is inert until its real bit is hardware-verified"
+        );
         assert!(!edge.side_l && !edge.side_r);
     }
 

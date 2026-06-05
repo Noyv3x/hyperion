@@ -350,6 +350,107 @@ pub type ControlPlaneTx = crossbeam_channel::Sender<ControlPlaneEvent>;
 /// The control-plane side of the channel: the consumer the supervisor drains off the hot path.
 pub type ControlPlaneRx = crossbeam_channel::Receiver<ControlPlaneEvent>;
 
+/// The concrete effect a `BindTarget::Special(id)` edge resolves to (M7), decoded purely from the
+/// active profile's [`SpecialAction`] so the OS-side dispatch (in the supervisor's control-plane
+/// drain thread) is a thin shell. Kept Linux-testable: the id→effect resolution is the pure
+/// [`special_action_effect`]; the side-effecting half (route a `ControlMsg`, spawn a process) lives
+/// in the `cfg(windows)` supervisor.
+///
+/// ## Encoding (no `core` change)
+///
+/// [`SpecialAction`](hyperion_core::map::SpecialAction) is `{ id, name }` with no structured action
+/// field, and `core` is out of scope here, so the action is carried in the `name` string via a
+/// documented `kind:payload` prefix — the same lightweight convention a GUI special-action editor
+/// would round-trip:
+///
+/// * `profile:<profile_id>` → [`SpecialEffect::SwitchProfile`] of the active device to `<profile_id>`
+///   (only when that profile exists and differs from the current assignment).
+/// * `launch:<program> [args…]` → [`SpecialEffect::LaunchProgram`] (whitespace-split; the first
+///   token is the program, the rest are arguments).
+///
+/// Anything else (an unknown prefix, an empty payload, a switch to a missing/already-active profile)
+/// resolves to `None`, so an unconfigured / display-only special is inert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpecialEffect {
+    /// Switch the active device's assigned profile through the single-writer `ControlMsg` path.
+    SwitchProfile {
+        /// Device id whose assignment is changed (the config's `active_device`).
+        device: String,
+        /// Profile id to assign.
+        name: String,
+    },
+    /// Launch an external program off the hot path via `std::process::Command`.
+    LaunchProgram {
+        /// Program / executable path.
+        program: String,
+        /// Whitespace-split arguments (possibly empty).
+        args: Vec<String>,
+    },
+}
+
+/// Resolve a `BindTarget::Special(id)` edge to its concrete [`SpecialEffect`] against the live
+/// config snapshot (M7). **Pure + Linux-testable** — the whole decision the `cfg(windows)`
+/// control-plane drain thread makes, factored out of the OS dispatch.
+///
+/// Looks `id` up in the active device's assigned profile's `specials` (falling back to scanning all
+/// profiles' `specials` only if the active profile has none with that id, so a special defined on a
+/// shared profile still resolves), then decodes the [`SpecialAction::name`] via the `kind:payload`
+/// convention documented on [`SpecialEffect`]. Returns `None` for an unknown id, an unrecognized /
+/// empty action, or a profile-switch that would be a no-op (missing profile, or already the active
+/// assignment) — so a redundant special never churns the config generation.
+#[must_use]
+pub fn special_action_effect(
+    cfg: &hyperion_core::config::EngineConfig,
+    id: u16,
+) -> Option<SpecialEffect> {
+    let action = find_special(cfg, id)?;
+    let (kind, payload) = action.name.split_once(':')?;
+    match kind.trim() {
+        "profile" => {
+            let target = payload.trim();
+            if target.is_empty() || !cfg.profiles.contains_key(target) {
+                return None;
+            }
+            let device = cfg.active_device.as_str();
+            // Skip a switch to the already-assigned profile (no needless generation bump).
+            if cfg.assignments.get(device).map(String::as_str) == Some(target) {
+                return None;
+            }
+            Some(SpecialEffect::SwitchProfile {
+                device: device.to_string(),
+                name: target.to_string(),
+            })
+        }
+        "launch" => {
+            let mut parts = payload.split_whitespace();
+            let program = parts.next()?.to_string();
+            let args = parts.map(str::to_string).collect();
+            Some(SpecialEffect::LaunchProgram { program, args })
+        }
+        _ => None, // unknown action kind: ignore.
+    }
+}
+
+/// Find the [`SpecialAction`] with `id`, preferring the active device's assigned profile and
+/// falling back to any profile that defines it (so a special on a shared/non-active profile still
+/// resolves). Returns the first match.
+fn find_special(cfg: &hyperion_core::config::EngineConfig, id: u16) -> Option<&SpecialAction> {
+    // Active device's assigned profile first.
+    if let Some(active) = cfg
+        .assignments
+        .get(&cfg.active_device)
+        .and_then(|pid| cfg.profiles.get(pid))
+    {
+        if let Some(a) = active.specials.iter().find(|s| s.id == id) {
+            return Some(a);
+        }
+    }
+    // Fall back to any profile defining the id.
+    cfg.profiles
+        .values()
+        .find_map(|p| p.specials.iter().find(|s| s.id == id))
+}
+
 /// Decide the auto-profile-switch edit for the current foreground app (blueprint §7.4, §12 M5).
 ///
 /// Pure + Linux-testable: this is the whole decision the `cfg(windows)` `ForegroundWatcher` makes
@@ -570,5 +671,120 @@ mod tests {
         r.device = "other".to_string();
         let cfg = cfg_with_rules(true, vec![r]);
         assert!(auto_switch_decision(&cfg, "mygame.exe", "x").is_none());
+    }
+
+    // ----------------------------- M7: special-action id -> effect mapping ------------------------
+    // `SpecialAction` is already in scope via the file-level import (`super::*`).
+
+    /// `cfg_with_rules` (device `"dev"` -> `"default"`, plus `"fps"`) with the given specials added
+    /// to the **active** (`"default"`) profile.
+    fn cfg_with_specials(specials: Vec<SpecialAction>) -> EngineConfig {
+        let mut cfg = cfg_with_rules(false, vec![]);
+        let profiles = Arc::make_mut(&mut cfg.profiles);
+        profiles.get_mut("default").unwrap().specials = specials;
+        cfg
+    }
+
+    fn special(id: u16, name: &str) -> SpecialAction {
+        SpecialAction {
+            id,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn special_profile_switch_resolves_to_switch_effect() {
+        // `profile:fps` on the active profile -> switch the active device to `fps`.
+        let cfg = cfg_with_specials(vec![special(1, "profile:fps")]);
+        assert_eq!(
+            special_action_effect(&cfg, 1),
+            Some(SpecialEffect::SwitchProfile {
+                device: "dev".to_string(),
+                name: "fps".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn special_profile_switch_to_active_or_missing_is_none() {
+        // Switching to the ALREADY-assigned profile is a no-op (no generation churn).
+        let cfg = cfg_with_specials(vec![special(1, "profile:default")]);
+        assert!(special_action_effect(&cfg, 1).is_none());
+        // Switching to a non-existent profile resolves to nothing (never assign a missing id).
+        let cfg = cfg_with_specials(vec![special(2, "profile:ghost")]);
+        assert!(special_action_effect(&cfg, 2).is_none());
+    }
+
+    #[test]
+    fn special_launch_resolves_program_and_args() {
+        let cfg = cfg_with_specials(vec![special(7, "launch:notepad.exe a.txt b.txt")]);
+        assert_eq!(
+            special_action_effect(&cfg, 7),
+            Some(SpecialEffect::LaunchProgram {
+                program: "notepad.exe".to_string(),
+                args: vec!["a.txt".to_string(), "b.txt".to_string()],
+            })
+        );
+        // A launch with no args yields an empty arg list.
+        let cfg = cfg_with_specials(vec![special(8, "launch:calc.exe")]);
+        assert_eq!(
+            special_action_effect(&cfg, 8),
+            Some(SpecialEffect::LaunchProgram {
+                program: "calc.exe".to_string(),
+                args: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn special_unknown_id_or_kind_or_empty_is_none() {
+        let cfg = cfg_with_specials(vec![special(1, "profile:fps")]);
+        // Unknown id: not in the table.
+        assert!(special_action_effect(&cfg, 99).is_none());
+        // Unknown kind prefix.
+        let cfg = cfg_with_specials(vec![special(1, "frobnicate:x")]);
+        assert!(special_action_effect(&cfg, 1).is_none());
+        // A display-only name with no `kind:payload` separator.
+        let cfg = cfg_with_specials(vec![special(1, "My Special")]);
+        assert!(special_action_effect(&cfg, 1).is_none());
+        // Empty launch payload yields no program.
+        let cfg = cfg_with_specials(vec![special(1, "launch:")]);
+        assert!(special_action_effect(&cfg, 1).is_none());
+        // Empty profile payload.
+        let cfg = cfg_with_specials(vec![special(1, "profile:")]);
+        assert!(special_action_effect(&cfg, 1).is_none());
+    }
+
+    #[test]
+    fn special_resolves_from_any_profile_when_active_lacks_it() {
+        // A special defined only on a NON-active profile (`fps`) still resolves (fallback scan).
+        let mut cfg = cfg_with_rules(false, vec![]);
+        let profiles = Arc::make_mut(&mut cfg.profiles);
+        profiles.get_mut("fps").unwrap().specials = vec![special(5, "launch:tool.exe")];
+        assert_eq!(
+            special_action_effect(&cfg, 5),
+            Some(SpecialEffect::LaunchProgram {
+                program: "tool.exe".to_string(),
+                args: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn special_active_profile_takes_precedence_on_id_collision() {
+        // Both the active (`default`) and a non-active (`fps`) profile define id 3; the active
+        // profile's action wins (so a per-profile special overrides a shared one).
+        let mut cfg = cfg_with_rules(false, vec![]);
+        let profiles = Arc::make_mut(&mut cfg.profiles);
+        profiles.get_mut("default").unwrap().specials = vec![special(3, "profile:fps")];
+        profiles.get_mut("fps").unwrap().specials = vec![special(3, "launch:wrong.exe")];
+        assert_eq!(
+            special_action_effect(&cfg, 3),
+            Some(SpecialEffect::SwitchProfile {
+                device: "dev".to_string(),
+                name: "fps".to_string(),
+            }),
+            "active profile's special wins on an id collision"
+        );
     }
 }

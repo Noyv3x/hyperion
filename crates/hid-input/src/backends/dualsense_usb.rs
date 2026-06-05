@@ -6,11 +6,14 @@
 //! de-quantization, the DS sensor-timestamp `SensorClock` (u16 wrap, 16/3 µs/tick), and the
 //! byte-7 sequence-counter drop/dupe accounting — live in core (DESIGN §7).
 //!
-//! The overlapped `ReadFile` body is an M1 bring-up stub (`TODO(hardware)`), but [`parse_into`]
-//! is the **real, testable I/O→core seam**: a Windows smoke test injects a synthetic report
-//! buffer and asserts the core parser populated the [`InputSample`], with no driver involved.
+//! The overlapped `ReadFile` body is real (single outstanding double-buffered read via
+//! [`OverlappedReader`]); [`parse_into`] is the **real, testable I/O→core seam**: a unit test
+//! injects a synthetic report buffer and asserts the core parser populated the [`InputSample`] (and
+//! the paired touch/Edge state), with no driver involved.
 
-use hyperion_core::input::ds_report::{ds_report_to_sticks, parse_ds_usb_report};
+use hyperion_core::input::ds_report::{
+    decode_controller_state, ds_report_to_sticks, parse_ds_usb_report,
+};
 use hyperion_core::input::dt_clock::SensorClock;
 use hyperion_core::input::normalize::u8_trigger;
 use hyperion_core::input::seq::SeqTracker;
@@ -18,7 +21,7 @@ use hyperion_core::input::{Buttons, InputSample, SourceMeta};
 
 use crate::win::enumerate::DeviceFilter;
 use crate::win::hid::{OverlappedReader, WaitMode, HID_REPORT_LEN};
-use crate::{DeviceId, DeviceSource, SourceError};
+use crate::{DeviceId, DeviceSource, EdgeButtons, SourceError, TouchEdge};
 
 /// A DualSense (or DualSense Edge) USB device exposed as a [`DeviceSource`].
 pub struct DualSenseUsbSource {
@@ -27,6 +30,10 @@ pub struct DualSenseUsbSource {
     clock: SensorClock,
     seq: SeqTracker,
     meta: SourceMeta,
+    /// Touch contacts + Edge button bits decoded from the most recent report, surfaced to the
+    /// engine via [`DeviceSource::touch_edge`] (the stick-only `InputSample` cannot carry them).
+    /// `Default` (untouched pad / all Edge bits `false`) until the first report decodes.
+    touch_edge: TouchEdge,
 }
 
 impl DualSenseUsbSource {
@@ -46,6 +53,7 @@ impl DualSenseUsbSource {
             clock: SensorClock::default(),
             seq: SeqTracker::default(),
             meta,
+            touch_edge: TouchEdge::default(),
         })
     }
 
@@ -77,13 +85,19 @@ impl DeviceSource for DualSenseUsbSource {
             }
             None => return Ok(false),
         };
-        Ok(parse_into(
-            &report,
-            out,
-            &mut self.clock,
-            &mut self.seq,
-            qpc_ns,
-        ))
+        let ok = parse_into(&report, out, &mut self.clock, &mut self.seq, qpc_ns);
+        // On a fresh decode, also surface the touchpad contacts + Edge bits (which the stick-only
+        // `InputSample` cannot carry) so the engine can copy them into its `HotInput`. A rejected
+        // buffer (wrong id / short) leaves the last good touch/Edge state untouched, matching how
+        // `parse_into` leaves `out` unchanged.
+        if ok {
+            self.touch_edge = touch_edge_from(&report, &self.meta);
+        }
+        Ok(ok)
+    }
+
+    fn touch_edge(&self) -> TouchEdge {
+        self.touch_edge
     }
 
     fn device_id(&self) -> DeviceId {
@@ -130,6 +144,36 @@ pub fn parse_into(
     out.dt_us = dt_us;
     out.host_qpc_ns = qpc_ns;
     true
+}
+
+/// Decode the touchpad contacts + DualSense Edge button bits a [`DeviceSource`] surfaces alongside
+/// the stick-only [`InputSample`] (M7 touch/Edge wiring).
+///
+/// A free function (like [`parse_into`]) so it is unit-testable with an injected buffer and no
+/// device. It runs the SAME pure core decode the engine's `ControllerState` build uses
+/// ([`decode_controller_state`]), so the contacts + Edge superset are identical to what the mapping
+/// engine would see — no parallel offset table. `meta.is_edge` gates the Edge bits (a non-Edge
+/// source reads them all `false`); a buffer too short for the touch tail decodes two inactive
+/// contacts. Returns the inert [`TouchEdge::default`] for a buffer that is not a valid report 0x01.
+#[inline]
+pub fn touch_edge_from(buf: &[u8], meta: &SourceMeta) -> TouchEdge {
+    let Some(report) = parse_ds_usb_report(buf) else {
+        return TouchEdge::default();
+    };
+    let state = decode_controller_state(&report, buf, meta);
+    TouchEdge {
+        touch: state.touch,
+        edge: EdgeButtons {
+            mute: state.mute,
+            capture: state.capture,
+            fn_l: state.fn_l,
+            fn_r: state.fn_r,
+            blp: state.blp,
+            brp: state.brp,
+            side_l: state.side_l,
+            side_r: state.side_r,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -196,5 +240,78 @@ mod tests {
 
         let short = [DS_USB_REPORT_ID; 10]; // shorter than DS_USB_REPORT_LEN
         assert!(!parse_into(&short, &mut out, &mut clock, &mut seq, 0));
+    }
+
+    // ------------------------------- M7: touch / Edge surfacing seam -----------------------------
+
+    use hyperion_core::input::ds_report::TOUCH_DATA_OFFSET;
+
+    const DS_META: SourceMeta = SourceMeta {
+        vid: 0x054C,
+        pid: 0x0CE6,
+        name: "ds",
+        stick_bits: 8,
+        is_edge: false,
+    };
+
+    const EDGE_META: SourceMeta = SourceMeta {
+        vid: 0x054C,
+        pid: 0x0DF2,
+        name: "edge",
+        stick_bits: 8,
+        is_edge: true,
+    };
+
+    /// Write an ACTIVE finger contact into a report's touch tail (high bit CLEAR == active, the C#
+    /// `IsActive` convention); mirrors the core `ds_report` test fixture.
+    fn set_touch(b: &mut [u8; HID_REPORT_LEN], finger: usize, id: u8, x: u16, y: u16) {
+        let base = TOUCH_DATA_OFFSET + finger * 4;
+        b[base] = id & 0x7F;
+        b[base + 1] = (x & 0xFF) as u8;
+        b[base + 2] = (((y & 0x0F) << 4) | ((x >> 8) & 0x0F)) as u8;
+        b[base + 3] = (y >> 4) as u8;
+    }
+
+    #[test]
+    fn touch_edge_from_surfaces_active_contact_and_edge_bit() {
+        // A synthetic report with one ACTIVE touch contact + (Edge source) the Mute bit set in the
+        // extended tail reaches `TouchEdge` through the same core decode the engine reads — no
+        // device, pure. Drives the #1 wiring gap end-to-end at the backend seam.
+        let mut buf = synth_report(0x80, 0x80, 0, 1, 0);
+        // Idle the OTHER finger (high bit set == inactive), then activate finger 0.
+        buf[TOUCH_DATA_OFFSET + 4] = 0x80;
+        set_touch(&mut buf, 0, 0x2A, 300, 120);
+        // Edge extended byte is one past the touch tail (core `EDGE_FN_BYTE`); 0x04 == Mute.
+        buf[TOUCH_DATA_OFFSET + 8] = 0x04;
+
+        // Edge-capable source: the contact AND the Mute bit surface.
+        let te = touch_edge_from(&buf, &EDGE_META);
+        assert!(te.touch[0].is_active, "active finger surfaced");
+        assert_eq!(te.touch[0].id, 0x2A);
+        assert_eq!((te.touch[0].x, te.touch[0].y), (300, 120));
+        assert!(!te.touch[1].is_active, "second finger stays inactive");
+        assert!(te.edge.mute, "Edge Mute bit surfaced for an Edge source");
+        assert!(!te.edge.fn_l && !te.edge.brp, "only Mute set");
+
+        // Non-Edge source: the touch contact still surfaces, but every Edge bit stays false.
+        let te_plain = touch_edge_from(&buf, &DS_META);
+        assert!(te_plain.touch[0].is_active && te_plain.touch[0].id == 0x2A);
+        assert!(!te_plain.edge.mute, "non-Edge source reads Edge bits false");
+        assert_eq!(te_plain.edge, EdgeButtons::default());
+    }
+
+    #[test]
+    fn touch_edge_from_idle_report_is_inert() {
+        // A report whose touch tail is idle (no `set_touch`) and whose Edge byte is zero decodes to
+        // the inert default — byte-identical to the pre-M7 `Default` the engine used to plug in.
+        let mut buf = synth_report(0x80, 0x80, 0, 1, 0);
+        buf[TOUCH_DATA_OFFSET] = 0x80; // both fingers high-bit-set == inactive
+        buf[TOUCH_DATA_OFFSET + 4] = 0x80;
+        assert_eq!(touch_edge_from(&buf, &EDGE_META), TouchEdge::default());
+
+        // A wrong-id buffer also yields the inert default (never a partial decode).
+        let mut bad = buf;
+        bad[0] = 0x31;
+        assert_eq!(touch_edge_from(&bad, &DS_META), TouchEdge::default());
     }
 }

@@ -1904,6 +1904,59 @@ mod tests {
     }
 
     #[test]
+    fn touchpad_as_mouse_two_contacts_emit_delta_with_remainder_carry() {
+        // M7 end-to-end wiring proof: two successive same-finger contacts feed `touch_step` through
+        // apply() and emit a mouse delta, with the sub-pixel remainder carried in `ms.touch_mouse`
+        // between reports (no motion lost). Pick a tiny coefficient so each +10 grid-unit slide is
+        // ~0.4 px: three carry reports give 0,0,1 (rem ≈ 0.2), exactly the accumulator carry contract
+        // exercised here through the full engine path (not the accumulator unit test).
+        let rp = rp_touch(TouchpadSettings {
+            as_mouse: true,
+            sensitivity: 0.04, // 10 grid units * 0.04 = 0.4 px/report
+            velocity_offset: 0.0,
+            min_threshold: 1.0, // always-carry
+            jitter_comp: false,
+            ..TouchpadSettings::default()
+        });
+        let mut ms = MapState::default();
+
+        // First report establishes prev_touch at x=0 (no prior contact -> no jump).
+        let (_, b0) = apply(&touch_state(active_contact(1, 0, 0)), &rp, &mut ms, 1_000);
+        assert!(
+            b0.as_slice()
+                .iter()
+                .all(|e| !matches!(e, KbmEvent::MouseMove { .. })),
+            "touch-down must not jump"
+        );
+
+        // Three same-finger slides of +10 x each: per-report 0.4 px -> dx 0, 0, 1 (carry to a pixel).
+        let xs = [10u16, 20, 30];
+        let mut dxs = [0i32; 3];
+        let mut t = 6_000u64;
+        for (i, &x) in xs.iter().enumerate() {
+            let (_, b) = apply(&touch_state(active_contact(1, x, 0)), &rp, &mut ms, t);
+            for e in b.as_slice() {
+                if let KbmEvent::MouseMove { dx, dy } = e {
+                    assert_eq!(*dy, 0, "pure-x drag -> no vertical");
+                    dxs[i] = *dx;
+                }
+            }
+            t += 5_000;
+        }
+        assert_eq!(
+            dxs,
+            [0, 0, 1],
+            "0.4px×3 carries through apply() to 0,0,1 (remainder accumulates), got {dxs:?}"
+        );
+        // The leftover sub-pixel fraction lives in the resident touch accumulator (~0.2 px).
+        let (h, _) = ms.touch_mouse.remainder();
+        assert!(
+            (h - 0.2).abs() < 1e-9,
+            "carried remainder ≈ 0.2 after the pixel emit, got {h}"
+        );
+    }
+
+    #[test]
     fn touchpad_touchdown_does_not_jump() {
         // A fresh touch-down (prev inactive) must NOT emit a jump from the origin.
         let rp = rp_touch(TouchpadSettings {

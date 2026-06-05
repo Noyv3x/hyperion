@@ -58,6 +58,12 @@ pub struct Supervisor {
     /// table (blueprint §5/§12 M4). Drained off the hot path by the control-plane thread spawned in
     /// [`Supervisor::spawn`]; `None` once consumed.
     ctrl_rx: Option<ControlPlaneRx>,
+    /// Optional `ControlMsg` sender into the single config-writer (M7 special actions). Set by the
+    /// owner (e.g. [`crate::runtime::Runtime`]) via [`Supervisor::set_control_sender`] so a
+    /// profile-switch special routes through the SAME single-writer path the GUI uses. `None` when
+    /// no writer is wired (e.g. the headless slice), in which case profile-switch specials are a
+    /// no-op (program-launch specials still run, they need no writer).
+    control_tx: Option<Sender<ControlMsg>>,
     /// Built once and moved onto the hot thread at spawn.
     hot_links: Option<HotLinks>,
 }
@@ -103,6 +109,7 @@ impl Supervisor {
             telemetry_rx: Some(telemetry_rx),
             kbm_rx: Some(kbm_rx),
             ctrl_rx: Some(ctrl_rx),
+            control_tx: None,
             hot_links: Some(HotLinks {
                 commands: command_rx,
                 telemetry: telemetry_tx,
@@ -141,6 +148,15 @@ impl Supervisor {
     /// consumed the supervisor. Mutually exclusive with [`Supervisor::request_shutdown`].
     pub fn take_sup_tx(&mut self) -> Option<CommandTx> {
         self.sup_tx.take()
+    }
+
+    /// Wire the single config-writer's [`ControlMsg`] sender so M7 special actions can route a
+    /// profile-switch through the SAME single-writer path the GUI/auto-switch watcher use (the hot
+    /// loop sees only the resulting generation bump). Call **before** [`Supervisor::spawn`]; the
+    /// clone is handed to the control-plane drain thread. Without it, profile-switch specials are a
+    /// no-op (program-launch specials still run — they need no writer).
+    pub fn set_control_sender(&mut self, control_tx: Sender<ControlMsg>) {
+        self.control_tx = Some(control_tx);
     }
 
     /// Request the hot loop to shut down (used by the headless slice / tray exit). No-op once
@@ -188,21 +204,43 @@ impl Supervisor {
         // exits on its own once the hot thread's `KbmTx` is dropped and the ring is drained, so no
         // explicit stop channel is needed — `RunningSupervisor::join` joins it after the hot
         // thread has finished (which drops the `KbmTx`).
+        //
+        // The injector owns a `MacroPlayer` (M7): the macro-table channel feeds it the active
+        // profile's resolved macro table, sourced from `ControlPlaneEvent::Macros` by the
+        // control-plane drain thread spawned just below. Bounded so the drain thread's forward never
+        // blocks; a missed publish re-sends on the next generation gate.
+        let (macro_tx, macro_rx) =
+            crossbeam_channel::bounded::<crate::win_io::MacroTable>(CONTROL_PLANE_CAP);
         let kbm_injector = match self.kbm_rx.take() {
-            Some(kbm_rx) => {
-                Some(spawn_kbm_injector(kbm_rx).map_err(|e| EngineError::Platform(e.to_string()))?)
+            Some(kbm_rx) => Some(
+                spawn_kbm_injector(kbm_rx, macro_rx)
+                    .map_err(|e| EngineError::Platform(e.to_string()))?,
+            ),
+            None => {
+                // No ring consumer: drop the macro receiver so the drain thread's forward sees a
+                // disconnected channel and skips the publish (no injector to feed).
+                drop(macro_rx);
+                None
             }
-            None => None,
         };
 
-        // (2c) Spawn the control-plane drain thread (blueprint §5/§12 M4): it drains the hot loop's
-        // `Special` edges + macro-table publishes off the hot path. For M4 the special-action
-        // handler is a minimal stub (log/ack); real exec (profile switch / launch / disconnect)
-        // builds on this in M5. It exits when the hot thread's `ControlPlaneTx` is dropped.
+        // (2c) Spawn the control-plane drain thread (blueprint §5/§12 M4/M7): it drains the hot
+        // loop's `Special` edges + macro-table publishes off the hot path. `Special` edges are
+        // dispatched against the active profile's `specials` (profile-switch routed through the
+        // single-writer `ControlMsg` path; program-launch via `std::process::Command`, both cold);
+        // `Macros` publishes are forwarded to the injector's `MacroPlayer` over `macro_tx`. It exits
+        // when the hot thread's `ControlPlaneTx` is dropped.
         let ctrl_drain = self
             .ctrl_rx
             .take()
-            .map(spawn_control_plane_drain)
+            .map(|rx| {
+                spawn_control_plane_drain(
+                    rx,
+                    self.config.clone(),
+                    self.control_tx.clone(),
+                    macro_tx,
+                )
+            })
             .transpose()
             .map_err(|e: std::io::Error| EngineError::Platform(e.to_string()))?;
 
@@ -299,50 +337,77 @@ impl RunningSupervisor {
     }
 }
 
-/// Spawn the control-plane drain thread (blueprint §5/§12 M4): a normal-priority worker that
+/// Spawn the control-plane drain thread (blueprint §5/§12 M4/M7): a normal-priority worker that
 /// receives [`ControlPlaneEvent`]s from the hot loop and runs them **off** the hot path.
 ///
-/// * [`ControlPlaneEvent::Special`] → run the matching special action. For M4 this is a minimal
-///   stub: it logs/acks the id (real profile-switch / launch / disconnect exec builds on this in
-///   M5, routed back through the single-writer `ControlMsg` path so the hot loop sees only a
-///   generation bump).
+/// * [`ControlPlaneEvent::Special`] → resolve the id against the **active** profile's `specials`
+///   (read from the live `config` snapshot) and run the matching `SpecialAction` via
+///   [`run_special_action`]: a profile-switch routes a [`ControlMsg::SetActiveProfile`] through the
+///   single-writer `control_tx` (so the hot loop sees only a generation bump), and a program-launch
+///   spawns the target via `std::process::Command` — both off the hot path. Unknown ids / actions
+///   are ignored.
 /// * [`ControlPlaneEvent::Macros`] → the active profile's resolved macro table, republished on
-///   start and every profile change. The injector's `MacroPlayer` consumes these to play a
-///   `Macro{start}` edge by id; the latest table is held here so a profile switch swaps the macro
-///   set without touching the hot thread.
+///   start and every profile change. It is forwarded to the injector's `MacroPlayer` over
+///   `macro_tx`; the player swaps the macro set without touching the hot thread.
 ///
 /// The thread exits when the hot thread's [`ControlPlaneTx`] is dropped (channel disconnect), which
 /// is the clean drain-and-exit signal joined in [`RunningSupervisor::join`].
-fn spawn_control_plane_drain(rx: ControlPlaneRx) -> std::io::Result<JoinHandle<()>> {
+fn spawn_control_plane_drain(
+    rx: ControlPlaneRx,
+    config: ConfigHandle,
+    control_tx: Option<Sender<ControlMsg>>,
+    macro_tx: crate::win_io::MacroTableTx,
+) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("hyperion-control-plane".to_string())
         .spawn(move || {
-            // The number of macros in the latest published table (held so a future profile-switch
-            // handler / the injector wiring can read the active set). Updated on every `Macros`
-            // publish; tracking the count keeps the binding genuinely used while the injector-side
-            // consumption is wired in `win_io` by the maintainer.
-            let mut macro_count = 0usize;
             // `recv` blocks until an event or channel disconnect — zero CPU while idle, no poll.
             while let Ok(ev) = rx.recv() {
                 match ev {
                     ControlPlaneEvent::Special(id) => {
-                        // M4 stub: acknowledge the special edge off the hot path. Real exec (M5)
-                        // resolves `id` against the active profile's `specials` and routes the
-                        // effect (e.g. `SetActiveProfile`) through the single-writer control path.
-                        eprintln!("hyperion: special action {id} fired (M4 stub: logged)");
+                        // Resolve `id` against the live snapshot's active profile and run it off the
+                        // hot path (profile-switch through the single writer; launch via Command).
+                        let snapshot = config.load_full();
+                        run_special_action(&snapshot, id, control_tx.as_ref());
                     }
                     ControlPlaneEvent::Macros(table) => {
-                        // The active macro table for the injector's MacroPlayer (wired by the KBM
-                        // injector). Republished on start + every profile change; track its size so
-                        // a profile switch that changes the macro set is observable here.
-                        if table.len() != macro_count {
-                            macro_count = table.len();
-                            eprintln!("hyperion: macro table updated ({macro_count} macros)");
-                        }
+                        // Forward the active macro table to the injector's `MacroPlayer`. Drop-on-full
+                        // / disconnected (no injector): the table re-publishes on the next generation
+                        // gate, so the player converges without blocking this thread.
+                        let _ = macro_tx.try_send(table);
                     }
                 }
             }
         })
+}
+
+/// Run a `BindTarget::Special(id)` edge off the hot path (M7), resolving `id` against the active
+/// profile's `specials` in `cfg` and dispatching the matching `SpecialAction`.
+///
+/// The id→effect mapping is the pure [`crate::control::special_action_effect`] (Linux-tested); this
+/// function performs the OS side-effect: a `SpecialEffect::SwitchProfile` routes a
+/// [`ControlMsg::SetActiveProfile`] through the single-writer `control_tx` (so the change goes the
+/// SAME way a GUI edit does and the hot loop only sees a generation bump), and a
+/// `SpecialEffect::LaunchProgram` spawns the target via `std::process::Command`. An unknown id, a
+/// special with no recognized effect, or a profile-switch with no wired writer is a clean no-op.
+fn run_special_action(cfg: &EngineConfig, id: u16, control_tx: Option<&Sender<ControlMsg>>) {
+    use crate::control::{special_action_effect, SpecialEffect};
+    match special_action_effect(cfg, id) {
+        Some(SpecialEffect::SwitchProfile { device, name }) => {
+            // Route through the single writer (no-op if no writer is wired, e.g. headless).
+            if let Some(tx) = control_tx {
+                let _ = tx.send(ControlMsg::SetActiveProfile { device, name });
+            }
+        }
+        Some(SpecialEffect::LaunchProgram { program, args }) => {
+            // Cold path: spawn detached; a failure to launch is logged, never fatal. The child
+            // handle is dropped immediately (we never wait on it — fire-and-forget launch).
+            if let Err(e) = std::process::Command::new(&program).args(&args).spawn() {
+                eprintln!("hyperion: special action launch of {program:?} failed: {e}");
+            }
+        }
+        None => {} // unknown id / no recognized effect: ignore.
+    }
 }
 
 /// Spawn the hot thread, doing all thread-affine acquisition *inside* the spawned thread.

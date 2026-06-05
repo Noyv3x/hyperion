@@ -102,6 +102,11 @@ impl Runtime {
         let (writer_stop_tx, writer_stop_rx) = crossbeam_channel::bounded(1);
         let writer_join = spawn_control_writer(store, control_rx, writer_stop_rx);
 
+        // Wire the single-writer ControlMsg sender into the supervisor so a profile-switch special
+        // action routes through the SAME path the GUI / auto-switch watcher use (M7). Must precede
+        // `spawn()` (which consumes the supervisor). Program-launch specials need no sender.
+        supervisor.set_control_sender(control_tx.clone());
+
         // Spawn the foreground auto-profile-switch watcher (blueprint §7.4): a low-priority polling
         // thread that sends `SetActiveProfile` through a clone of the SAME single-writer channel the
         // GUI uses (the single-writer guarantee is intact — it is just another `ControlMsg` sender,

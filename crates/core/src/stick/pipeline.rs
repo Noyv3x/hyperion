@@ -29,6 +29,20 @@ use crate::stick::settings::{DeadZoneType, StickSettings, StickState};
 use crate::stick::stages;
 use crate::stick::{StickAlgorithm, StickSample};
 
+/// Collapse a non-finite axis value to neutral (0.0); pass finite values through unchanged.
+///
+/// The pure-core safety net for the stick egress (M7): NaN/Inf must never reach the virtual pad.
+/// Mirrors the mouse accumulator's non-finite guards so the whole core has one "non-finite →
+/// neutral" rule. `#[inline]` + branch-free-friendly; a finite chain is a no-op (goldens unchanged).
+#[inline]
+fn finite_or_zero(v: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
+}
+
 /// Process one stick report through the full DS4Windows-class chain.
 ///
 /// * `raw` — the device's stick sample in the canonical `[-1,1]` unit.
@@ -134,9 +148,14 @@ pub fn process_stick(
     y = ny;
 
     // --- exit [0,255] ONCE ---
+    // NaN/Inf guard (M7): an aberrant input or an atan2/sqrt/pow singularity anywhere in the chain
+    // (rotation, square-stick, output curve) could in principle surface a non-finite component. The
+    // virtual pad must NEVER see NaN/Inf, so clamp any non-finite axis to neutral (0.0) — the same
+    // "non-finite collapses to neutral" contract the mouse accumulator guards apply. A finite chain
+    // (every default/golden path) is untouched, so M1-M6 goldens stay byte-identical.
     let out = StickSample {
-        x: ds4_to_axis(x),
-        y: ds4_to_axis(y),
+        x: finite_or_zero(ds4_to_axis(x)),
+        y: finite_or_zero(ds4_to_axis(y)),
     };
 
     // --- stage 9: flick stick (terminal; M3 stashes the delta, returns abs stick unchanged) ---
@@ -150,9 +169,11 @@ pub fn process_stick(
     out
 }
 
-/// Stage 9 (M3 stub): compute the per-report relative turn and stash it in `st.flick_delta` for
-/// the M5 mouse path, WITHOUT folding it into the returned absolute stick. The flick angle bookkeeping
-/// (`flick_in_progress`/`flick_angle_remaining`/`flick_last_angle`) is updated so M5 is additive.
+/// Stage 9: compute the per-report relative turn and stash it in `st.flick_delta` for the mouse
+/// path, WITHOUT folding it into the returned absolute stick. Flick is **single-sweep** in v1 — the
+/// bookkeeping (`flick_in_progress` rising-edge anchor + `flick_last_angle`) yields the per-report
+/// angular delta directly; there is no remaining-angle accumulator (the dead `flick_angle_remaining`
+/// field was removed in M7). A whole-flick remaining-angle model is a future additive change.
 #[inline]
 fn flick_stash(out: StickSample, _cfg: &StickSettings, st: &mut StickState) {
     let magnitude = (out.x * out.x + out.y * out.y).sqrt();
@@ -313,6 +334,58 @@ mod tests {
         // Absolute stick unchanged (no fold into x/y).
         assert!((ox - 255.0).abs() < 1e-9, "ox={ox}");
         assert!(st.flick_in_progress);
+    }
+
+    #[test]
+    fn output_is_finite_for_nan_and_extreme_inputs() {
+        // M7 NaN guard: aberrant inputs (non-finite or extreme magnitudes) must never surface a
+        // NaN/Inf to the virtual pad — the egress clamps non-finite axes to neutral (0.0). Exercise
+        // both a pass-through chain and a fully-loaded chain (rotation/square/curve/sensitivity) that
+        // stresses the atan2/sqrt/pow stages where a singularity could arise.
+        let loaded = StickSettings {
+            sensitivity: 3.0,
+            rotation: crate::stick::settings::RotationSettings { angle_rad: 0.5 },
+            square: crate::stick::settings::SquareStick {
+                enabled: true,
+                roundness: 5.0,
+            },
+            curve: crate::stick::settings::OutputCurve::Cubic,
+            dead_zone: crate::stick::settings::StickDeadZone {
+                dead_zone: 10,
+                anti_dead_zone: 15,
+                ..crate::stick::settings::StickDeadZone::default()
+            },
+            ..StickSettings::default()
+        };
+        let dt = Dt::guarded(4000.0);
+        for cfg in [&StickSettings::default(), &loaded] {
+            for &(rx, ry) in &[
+                (f64::NAN, 0.0),
+                (0.0, f64::NAN),
+                (f64::INFINITY, f64::NEG_INFINITY),
+                (f64::NAN, f64::NAN),
+                (1e308, -1e308),
+                (-1e300, 1e300),
+            ] {
+                let mut st = StickState::default();
+                let out = process_stick(StickSample { x: rx, y: ry }, cfg, &mut st, dt);
+                assert!(
+                    out.x.is_finite() && out.y.is_finite(),
+                    "non-finite input ({rx},{ry}) must yield a finite output, got ({},{})",
+                    out.x,
+                    out.y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finite_or_zero_collapses_non_finite() {
+        assert_eq!(super::finite_or_zero(0.5), 0.5);
+        assert_eq!(super::finite_or_zero(-1.0), -1.0);
+        assert_eq!(super::finite_or_zero(f64::NAN), 0.0);
+        assert_eq!(super::finite_or_zero(f64::INFINITY), 0.0);
+        assert_eq!(super::finite_or_zero(f64::NEG_INFINITY), 0.0);
     }
 
     #[test]

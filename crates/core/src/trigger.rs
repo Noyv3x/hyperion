@@ -700,6 +700,166 @@ mod tests {
     }
 
     #[test]
+    fn two_stage_soft_threshold_below_deadzone_uses_max() {
+        // soft_threshold (30) < dead_zone (80): the soft stage must engage at max(soft,dz) == 80, not
+        // at 30. A raw between the two (50/255) is above the configured soft_threshold but inside the
+        // dead-zone, so it must NOT fire the soft stage. At/above 80 it fires.
+        let cfg = TriggerSettings {
+            mode: TriggerMode::TwoStage,
+            soft_threshold: 30,
+            dead_zone: 80,
+            ..TriggerSettings::default()
+        };
+        let mut st = TriggerState::default();
+        // 50/255: past soft_threshold 30 but inside dead_zone 80 -> max gate suppresses soft.
+        let lo = process_trigger_staged(50.0 / 255.0, &cfg, &mut st, dt());
+        assert!(
+            !lo.soft_pull && !lo.full_pull,
+            "soft must not fire below max(soft_threshold, dead_zone)"
+        );
+        // 90/255: past the effective gate (80) -> soft fires, full not yet.
+        let mid = process_trigger_staged(90.0 / 255.0, &cfg, &mut st, dt());
+        assert!(
+            mid.soft_pull && !mid.full_pull,
+            "soft fires at/above the max-gated threshold"
+        );
+    }
+
+    #[test]
+    fn hip_fire_soft_threshold_below_deadzone_uses_max() {
+        // Same max(soft_threshold, dead_zone) contract on the HipFire path. soft_threshold 20 <
+        // dead_zone 100: a 60/255 pull is past 20 but inside the dead-zone, so the window never opens
+        // and nothing fires no matter how long it is held.
+        let cfg = TriggerSettings {
+            mode: TriggerMode::HipFire,
+            soft_threshold: 20,
+            dead_zone: 100,
+            hip_fire_us: 10_000,
+            ..TriggerSettings::default()
+        }
+        .clamped();
+        let mut st = TriggerState::default();
+        for _ in 0..8 {
+            let o = process_trigger_staged(60.0 / 255.0, &cfg, &mut st, dt());
+            assert!(
+                !o.soft_pull && !o.full_pull,
+                "inside the dead-zone the hip-fire window never opens"
+            );
+        }
+        assert!(
+            !st.hip_active,
+            "window stays closed below the effective soft gate"
+        );
+    }
+
+    #[test]
+    fn two_stage_threshold_sweep() {
+        // Parameter sweep over (button_threshold, soft_threshold): for each pair the effective soft
+        // gate is max(soft_threshold, dead_zone) (dead_zone 0 here, so == soft_threshold), and the
+        // full stage is the raw 255 pull, independent of button_threshold. Assert the soft stage's
+        // edge lands exactly at the soft_threshold and the full stage needs a true full pull.
+        for button_threshold in [50u8, 100, 200] {
+            for soft_threshold in [40u8, 96, 160] {
+                let cfg = TriggerSettings {
+                    mode: TriggerMode::TwoStage,
+                    button_threshold,
+                    soft_threshold,
+                    ..TriggerSettings::default()
+                };
+                let mut st = TriggerState::default();
+                let st_f64 = f64::from(soft_threshold);
+
+                // Just below the soft threshold -> neither stage.
+                let below = (st_f64 - 1.0) / 255.0;
+                let o_below = process_trigger_staged(below, &cfg, &mut st, dt());
+                assert!(
+                    !o_below.soft_pull && !o_below.full_pull,
+                    "bt={button_threshold} soft={soft_threshold}: below soft -> nothing"
+                );
+
+                // At the soft threshold -> soft only (full needs raw 255).
+                let at = st_f64 / 255.0;
+                let o_at = process_trigger_staged(at, &cfg, &mut st, dt());
+                assert!(
+                    o_at.soft_pull && !o_at.full_pull,
+                    "bt={button_threshold} soft={soft_threshold}: at soft -> soft only"
+                );
+
+                // 254/255 is past soft but not a full pull -> still soft only (button_threshold has no
+                // effect on the two-stage gates).
+                let near_full = process_trigger_staged(254.0 / 255.0, &cfg, &mut st, dt());
+                assert!(
+                    near_full.soft_pull && !near_full.full_pull,
+                    "bt={button_threshold} soft={soft_threshold}: 254 -> soft only, not full"
+                );
+
+                // Full pull -> both stages.
+                let full = process_trigger_staged(1.0, &cfg, &mut st, dt());
+                assert!(
+                    full.soft_pull && full.full_pull,
+                    "bt={button_threshold} soft={soft_threshold}: full pull -> both"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hip_fire_timing_sweep_via_elapsed_us() {
+        // Sweep the hip-fire window across a range and assert the soft (aim) stage fires on exactly
+        // the report where the monotonic `st.elapsed_us`-derived window elapses — NO wall clock, NO
+        // threads, a fixed bounded report count. The window opens on the first engaged report (when
+        // elapsed first reaches one dt) and elapses when (elapsed - hip_start) >= hip_fire_us.
+        //
+        // With a per-report dt of 4ms, hip_start == 4ms (first engaged report). The window elapses on
+        // the first report where elapsed - 4ms >= hip_fire_us, i.e. elapsed >= hip_fire_us + 4ms, i.e.
+        // report ceil((hip_fire_us + 4ms) / 4ms). Hold ONLY the soft pull throughout.
+        let dt_us = dt().us() as i64; // 4000
+        let soft = 150.0 / 255.0; // past soft (default soft gate 100), not a full pull
+
+        for &hip_fire_us in &[4_000u32, 8_000, 12_000, 20_000] {
+            let cfg = TriggerSettings {
+                mode: TriggerMode::HipFire,
+                soft_threshold: 60,
+                hip_fire_us,
+                ..TriggerSettings::default()
+            }
+            .clamped();
+            let mut st = TriggerState::default();
+
+            // elapsed after report k is k*dt_us; hip_start = dt_us (report 1). The soft stage fires on
+            // the first report where (k*dt_us - dt_us) >= hip_fire_us.
+            let fire_report = {
+                let mut k = 1i64;
+                while (k * dt_us - dt_us) < i64::from(hip_fire_us) {
+                    k += 1;
+                }
+                k
+            };
+
+            // A generous but BOUNDED cap so the loop can never run away.
+            let cap = fire_report + 4;
+            let mut fired_at: Option<i64> = None;
+            for report in 1..=cap {
+                let o = process_trigger_staged(soft, &cfg, &mut st, dt());
+                if o.soft_pull {
+                    fired_at = Some(report);
+                    assert!(!o.full_pull, "soft-only pull never engages full");
+                    break;
+                }
+                assert!(
+                    !o.full_pull,
+                    "hip_fire_us={hip_fire_us}: full must not fire on a soft-only hold"
+                );
+            }
+            assert_eq!(
+                fired_at,
+                Some(fire_report),
+                "hip_fire_us={hip_fire_us}: soft (aim) stage fires exactly when the window elapses"
+            );
+        }
+    }
+
+    #[test]
     fn mode_serde_round_trip_and_unknown_fallback() {
         #[derive(serde::Serialize, serde::Deserialize)]
         struct W {

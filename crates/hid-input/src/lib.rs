@@ -17,7 +17,7 @@
 //! physical hardware is flagged with a `// HW-verify` note.
 #![cfg(windows)]
 
-use hyperion_core::input::{InputSample, SourceMeta};
+use hyperion_core::input::{InputSample, SourceMeta, TouchContact};
 
 pub mod backends;
 pub mod win;
@@ -42,8 +42,65 @@ pub trait DeviceSource: Send {
     /// * `Err(_)` — the device was lost or an unrecoverable I/O error occurred.
     fn next_sample(&mut self, out: &mut InputSample) -> Result<bool, SourceError>;
 
+    /// The decoded touchpad contacts + DualSense Edge button bits from the **most recent**
+    /// successful [`next_sample`](Self::next_sample) (M7 touch/Edge wiring).
+    ///
+    /// The stick-only [`InputSample`] cannot carry these (it lives in `hyperion_core` and is
+    /// alloc-free / device-agnostic), so the engine reads them through this paired accessor after a
+    /// fresh sample. The default impl returns the inert [`TouchEdge::default`] (untouched pad / all
+    /// Edge bits `false`), so a stick-only backend (XInput, the generic raw-HID skeleton) is
+    /// byte-identical to before; the DualSense backend overrides it to surface the contacts +
+    /// Mute/Capture/Fn/paddle/side bits its core decode already produces.
+    #[inline]
+    fn touch_edge(&self) -> TouchEdge {
+        TouchEdge::default()
+    }
+
     /// The VID/PID and OS instance path identifying this device.
     fn device_id(&self) -> DeviceId;
+}
+
+/// The decoded touchpad contacts + DualSense Edge button superset a [`DeviceSource`] surfaces
+/// alongside the stick-only [`InputSample`] (M7).
+///
+/// Carried separately from [`InputSample`] because that type is the device-agnostic, alloc-free
+/// `hyperion_core` value the stick pipeline consumes; the touch grid + the Edge Fn/paddle/Mute/
+/// Capture/side bits are DualSense-specific and only the DualSense backend fills them. `Default`
+/// (both contacts inactive, every Edge bit `false`) is the inert non-touch / non-Edge state, so an
+/// engine that copies these across is byte-identical to the pre-M7 inert path when the source does
+/// not decode them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TouchEdge {
+    /// The two decoded touchpad finger contacts (`core::input::ds_report::decode_touch`).
+    pub touch: [TouchContact; 2],
+    /// The DualSense / DualSense Edge extended button bits (gated by the source's `meta.is_edge`).
+    pub edge: EdgeButtons,
+}
+
+/// The DualSense / DualSense Edge extended button superset surfaced on a [`TouchEdge`] (M7).
+///
+/// Mirrors the capability-gated [`ControllerState`](hyperion_core::input::ControllerState) Edge
+/// fields the core decode fills only for an Edge-capable source: Mute, Capture, the two Fn buttons,
+/// the back-left/right paddles, and the two side buttons. `Default` (all `false`) is the inert
+/// non-Edge behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdgeButtons {
+    /// Mute button (DualSense / Edge).
+    pub mute: bool,
+    /// Capture / Create-adjacent capture button.
+    pub capture: bool,
+    /// Edge left function button.
+    pub fn_l: bool,
+    /// Edge right function button.
+    pub fn_r: bool,
+    /// Edge back-left paddle.
+    pub blp: bool,
+    /// Edge back-right paddle.
+    pub brp: bool,
+    /// Edge left side button.
+    pub side_l: bool,
+    /// Edge right side button.
+    pub side_r: bool,
 }
 
 /// Why a [`DeviceSource::next_sample`] call did not yield a fresh report.

@@ -28,7 +28,7 @@ use hyperion_core::output::{OutputState, PadTarget};
 use hyperion_core::stick::StickSample;
 
 use hid_input::win::hid::WaitMode as HidWaitMode;
-use hid_input::{DeviceSource as HidDeviceSource, DualSenseUsbSource, SourceError};
+use hid_input::{DeviceSource as HidDeviceSource, DualSenseUsbSource, SourceError, TouchEdge};
 use platform_win::hidhide::{HidHide, HidHideBackend};
 use platform_win::sched::{HotThreadConfig, WaitMode as SchedWaitMode};
 // `DynPad` (blueprint §6.3) is the static-dispatch X360-or-DS4 pad; its variant is chosen from the
@@ -167,7 +167,15 @@ impl DeviceSource for DualSenseDevice {
         }
         let is_prime = self.first_report;
         self.first_report = false;
-        Ok(Some(hot_input_from_sample(&self.sample, is_prime)))
+        // M7: pair the stick-only `InputSample` with the touch contacts + Edge bits the backend
+        // decoded from the SAME report (the trait surfaces them separately because `InputSample`
+        // is the device-agnostic core value). A stick-only backend returns the inert default.
+        let touch_edge = self.source.touch_edge();
+        Ok(Some(hot_input_from_sample(
+            &self.sample,
+            &touch_edge,
+            is_prime,
+        )))
     }
 }
 
@@ -180,21 +188,18 @@ impl DeviceSource for DualSenseDevice {
 /// reads the structured buttons with zero new device-side decode. `dt_us` / `dropped` /
 /// `is_duplicate` / `host_qpc_ns` carry through (the backend already folded them).
 ///
-/// **M6 touch / Edge (MAINTAINER NOTE).** [`HotInput`] now carries the two decoded touchpad finger
-/// contacts (`touch`) and the Edge button superset (`edge`); `core` decodes both in
-/// [`decode_controller_state`](hyperion_core::input::ds_report::decode_controller_state) /
-/// [`parse_controller_state`](hyperion_core::input::parse_controller_state). The `hid-input`
-/// `DeviceSource` trait, however, still fills only the stick-only [`InputSample`]
-/// (`next_sample(&mut InputSample)`) — it does **not** surface the `ControllerState` touch/Edge
-/// fields to the engine. So these are left at their inert `Default` here (untouched pad / all-Edge
-/// `false`), which is byte-identical to M5. To make touchpad-as-mouse / the touch-region controls /
-/// the Edge buttons live end-to-end, the `hid-input` backend (a sibling crate, outside the M6
-/// engine-file scope) must expose the decoded contacts — e.g. a `next_state(&mut ControllerState)`
-/// (or extend `InputSample` with `touch`/Edge) — and this function then copies `s.touch` / the Edge
-/// bits across. The whole `hot.rs` → `apply()` path already consumes them, so that is the only
-/// remaining wire.
+/// **M7 touch / Edge (now wired).** [`HotInput`] carries the two decoded touchpad finger contacts
+/// (`touch`) and the Edge button superset (`edge`); `core` decodes both in
+/// [`decode_controller_state`](hyperion_core::input::ds_report::decode_controller_state). The
+/// `hid-input` `DeviceSource` trait fills the stick-only [`InputSample`] AND surfaces the paired
+/// [`TouchEdge`] (`source.touch_edge()`), so this function now copies `te.touch` and the Edge bits
+/// straight across instead of leaving them inert. A stick-only backend (XInput / the raw-HID
+/// skeleton) returns the inert [`TouchEdge::default`], so its `HotInput` stays byte-identical to M5
+/// (untouched pad / all Edge bits `false`). The whole `hot.rs` → `apply()` path already consumes
+/// them, so touchpad-as-mouse, the `TouchLeft/Right/Upper/Multi` region controls, and the Edge
+/// `Fn/paddle/Mute/Capture/side` controls are live end-to-end.
 #[inline]
-fn hot_input_from_sample(s: &InputSample, is_prime: bool) -> HotInput {
+fn hot_input_from_sample(s: &InputSample, te: &TouchEdge, is_prime: bool) -> HotInput {
     HotInput {
         left: StickSample::new(s.left.x, s.left.y),
         right: StickSample::new(s.right.x, s.right.y),
@@ -204,15 +209,36 @@ fn hot_input_from_sample(s: &InputSample, is_prime: bool) -> HotInput {
         // `pack_xinput` (the single source of truth for the PadButtons→XInput bit layout, §9).
         buttons: hyperion_core::output::pack_xinput(ds_buttons_to_pad(s.buttons.0)),
         raw_buttons: s.buttons.0,
-        // Inert until the `hid-input` backend surfaces the decoded touch/Edge state (see the
-        // maintainer note above). Default == untouched pad / non-Edge — byte-identical to M5.
-        touch: Default::default(),
-        edge: Default::default(),
+        // M7: the backend-decoded touchpad contacts + Edge superset, plugged straight into the
+        // structured `ControllerState` the mapping engine reads (`controller_state_from`). Both
+        // default inert, so a non-touch / non-Edge source is byte-identical to M5.
+        touch: te.touch,
+        edge: edge_buttons_from(&te.edge),
         dt_us: s.dt_us,
         is_prime,
         dropped: s.dropped,
         is_duplicate: s.is_duplicate,
         host_qpc_ns: s.host_qpc_ns,
+    }
+}
+
+/// Re-home the `hid-input` [`EdgeButtons`](hid_input::EdgeButtons) (the backend's Edge bit bundle)
+/// into the engine's [`EdgeButtons`](crate::hot::EdgeButtons) value the [`HotInput`] carries.
+///
+/// Two structurally-identical flat bundles of bools live in two crates so neither takes a dependency
+/// on the other's type; this is the one-place field-for-field copy. Both default to all-`false`
+/// (inert non-Edge), so a stick-only / non-Edge source stays byte-identical to M5.
+#[inline]
+fn edge_buttons_from(e: &hid_input::EdgeButtons) -> crate::hot::EdgeButtons {
+    crate::hot::EdgeButtons {
+        mute: e.mute,
+        capture: e.capture,
+        fn_l: e.fn_l,
+        fn_r: e.fn_r,
+        blp: e.blp,
+        brp: e.brp,
+        side_l: e.side_l,
+        side_r: e.side_r,
     }
 }
 
@@ -359,42 +385,105 @@ impl VirtualPad for DynPadTarget {
     }
 }
 
+/// The injector's macro-table feed (M7): the resolved active profile's `Arc<[MacroDef]>`, sent from
+/// the supervisor's control-plane drain thread (which receives `ControlPlaneEvent::Macros` off the
+/// hot loop) to the KBM injector's `MacroPlayer`. A bounded `crossbeam` channel — a missed publish
+/// re-sends on the next generation gate, so the injector's `MacroPlayer` always converges on the
+/// active set.
+pub(crate) type MacroTable = std::sync::Arc<[hyperion_core::map::MacroDef]>;
+/// Receiving end of the [`MacroTable`] feed, owned by the KBM injector thread.
+pub(crate) type MacroTableRx = crossbeam_channel::Receiver<MacroTable>;
+/// Sending end of the [`MacroTable`] feed, owned by the supervisor's control-plane drain thread.
+pub(crate) type MacroTableTx = crossbeam_channel::Sender<MacroTable>;
+
 /// Spawn the **KBM injector** thread (blueprint §7.3): a normal-priority worker that drains the
 /// hot loop's [`KbmRx`] egress ring and realizes each [`KbmBatch`](hyperion_core::output::KbmBatch)
 /// via one batched `SendInput`. Macro playback timing (the unbounded part) lives here, never on
 /// the hot thread.
 ///
+/// **M7 macro wiring.** The thread owns a `MacroPlayer`: it installs the active profile's macro
+/// table whenever one arrives on `macro_rx` (sourced from `ControlPlaneEvent::Macros` via the
+/// supervisor), routes every drained `KbmEvent::Macro` edge to `MacroPlayer::on_edge`, and ticks
+/// the player (`MacroPlayer::tick`) on each wake so in-flight macros advance their step schedule.
+/// The player's returned next-deadline bounds the sleep (so a parked macro wakes exactly when due,
+/// never busy-spins), clamped to [`KBM_IDLE_POLL`] so the producer/abandon checks still run promptly.
+///
 /// The thread exits cleanly when the producer (the hot thread's `KbmTx`) is dropped and the ring
-/// is drained ([`KbmRx::is_abandoned`]); on shutdown it releases any keys it is holding so a
-/// crash/stop never leaves a key stuck down. Idle drains sleep [`KBM_IDLE_POLL`] (no busy-spin).
+/// is drained ([`KbmRx::is_abandoned`]); on shutdown it releases any keys it is holding (including
+/// macro-held keys, via `MacroPlayer::stop_all` then `release_all`) so a crash/stop never leaves a
+/// key stuck down. A profile swap installs a fresh table, which stops any in-flight macro cleanly.
 ///
 /// The Win32 `SendInput` body lives in the `kbm-output` crate's `SendInputKbm` (`KbmSink`); this
 /// is the only place the engine touches it, and it is `cfg(windows)` so the pure-core Linux CI is
 /// unaffected.
-pub(crate) fn spawn_kbm_injector(mut kbm_rx: KbmRx) -> std::io::Result<JoinHandle<()>> {
-    use kbm_output::{KbmSink, SendInputKbm};
+pub(crate) fn spawn_kbm_injector(
+    mut kbm_rx: KbmRx,
+    macro_rx: MacroTableRx,
+) -> std::io::Result<JoinHandle<()>> {
+    use hyperion_core::output::KbmEvent;
+    use kbm_output::{KbmSink, MacroPlayer, SendInputKbm};
+    use std::time::Instant;
 
     std::thread::Builder::new()
         .name("hyperion-kbm-injector".to_string())
         .spawn(move || {
             let mut sink = SendInputKbm::new();
+            let mut player = MacroPlayer::new();
             loop {
-                // Drain everything currently queued, flushing each batch in one SendInput.
+                // (a) Install the latest macro table if the supervisor published one (profile swap
+                // / start). Drain the channel so only the most recent table sticks; `set_macros`
+                // stops any in-flight macro cleanly against the OLD defs first (no stuck keys).
+                let mut latest_table = None;
+                while let Ok(table) = macro_rx.try_recv() {
+                    latest_table = Some(table);
+                }
+                if let Some(table) = latest_table {
+                    player.set_macros(&mut sink, table.iter().cloned());
+                }
+
+                // (b) Drain the egress ring, flushing each batch in one SendInput and routing any
+                // `Macro` start/stop edges to the player (the sink itself stages nothing for them).
                 let mut drained_any = false;
                 while let Some(batch) = kbm_rx.pop() {
                     drained_any = true;
+                    for &ev in batch.as_slice() {
+                        if let KbmEvent::Macro { id, start } = ev {
+                            player.on_edge(&mut sink, id, start);
+                        }
+                    }
                     if let Err(e) = sink.flush(&batch) {
                         log_kbm_err(&e);
                     }
                 }
-                // Producer gone and ring drained: release held keys and exit cleanly.
+
+                // (c) Advance in-flight macros; the returned soonest deadline bounds our sleep.
+                let now = Instant::now();
+                let next_deadline = player.tick(&mut sink, now);
+
+                // (d) Producer gone and ring drained: stop macros (release their held keys), release
+                // everything else, and exit cleanly.
                 if kbm_rx.is_abandoned() {
+                    player.stop_all(&mut sink);
                     let _ = sink.release_all();
                     return;
                 }
-                // Idle: sleep briefly so the thread is near-zero CPU when nothing is queued.
+
+                // (e) Idle: if we drained nothing this pass, sleep until the soonest macro deadline
+                // (capped at KBM_IDLE_POLL so the abandon/producer checks stay responsive). With no
+                // macro running the deadline is `None` -> the full idle poll. A runnable-now macro
+                // reports `now` -> a zero sleep, so we re-tick it at once; the player parks every
+                // running macro on a FUTURE wait within that one tick, so the next pass sleeps (no
+                // busy-spin). The zero-sleep call is skipped so a runnable macro loops immediately.
                 if !drained_any {
-                    std::thread::sleep(KBM_IDLE_POLL);
+                    let sleep = match next_deadline {
+                        Some(t) => t
+                            .saturating_duration_since(Instant::now())
+                            .min(KBM_IDLE_POLL),
+                        None => KBM_IDLE_POLL,
+                    };
+                    if !sleep.is_zero() {
+                        std::thread::sleep(sleep);
+                    }
                 }
             }
         })
@@ -468,12 +557,67 @@ mod tests {
             buttons: hyperion_core::input::Buttons(0x20 | 0x08), // Cross + neutral hat
             ..InputSample::default()
         };
-        let hi = hot_input_from_sample(&s, false);
+        let hi = hot_input_from_sample(&s, &TouchEdge::default(), false);
         assert_eq!(hi.raw_buttons, 0x20 | 0x08, "raw DS word carried through");
         assert_eq!(
             hi.buttons, XI_A,
             "fast-path XInput word packed from PadButtons"
         );
+    }
+
+    #[test]
+    fn hot_input_default_touch_edge_is_inert() {
+        // A stick-only backend (or any report with no touch / non-Edge source) returns the inert
+        // `TouchEdge::default`, which must produce an untouched pad + all-false Edge bits on the
+        // `HotInput` — byte-identical to the pre-M7 inert path.
+        let hi = hot_input_from_sample(&InputSample::default(), &TouchEdge::default(), false);
+        assert_eq!(
+            hi.touch,
+            [hyperion_core::input::TouchContact::default(); 2],
+            "no contacts surface from the inert default"
+        );
+        assert_eq!(
+            hi.edge,
+            crate::hot::EdgeButtons::default(),
+            "all Edge bits false"
+        );
+    }
+
+    #[test]
+    fn hot_input_carries_touch_contacts_and_edge_bits() {
+        // The #1 M7 wire: a backend-surfaced `TouchEdge` (active contact + a couple of Edge bits)
+        // must reach `HotInput.touch` / `HotInput.edge` verbatim, so `hot.rs`'s
+        // `controller_state_from` (and thus `apply()`'s touch path + Edge controls) see them.
+        let te = TouchEdge {
+            touch: [
+                hyperion_core::input::TouchContact {
+                    is_active: true,
+                    id: 9,
+                    x: 256,
+                    y: 64,
+                },
+                hyperion_core::input::TouchContact::default(),
+            ],
+            edge: hid_input::EdgeButtons {
+                mute: true,
+                fn_r: true,
+                side_l: true,
+                ..hid_input::EdgeButtons::default()
+            },
+        };
+        let hi = hot_input_from_sample(&InputSample::default(), &te, false);
+        // Touch contact carried through unchanged.
+        assert!(hi.touch[0].is_active && hi.touch[0].id == 9);
+        assert_eq!((hi.touch[0].x, hi.touch[0].y), (256, 64));
+        assert!(!hi.touch[1].is_active);
+        // Edge bits map field-for-field into the engine's EdgeButtons.
+        assert!(hi.edge.mute && hi.edge.fn_r && hi.edge.side_l);
+        assert!(
+            !hi.edge.capture && !hi.edge.fn_l && !hi.edge.blp && !hi.edge.brp && !hi.edge.side_r
+        );
+        // `hot::controller_state_from` (a sibling-module consumer, covered by hot.rs's own touch
+        // test) then reads these into the touch-region + Edge controls — so this `HotInput` is the
+        // complete remaining wire.
     }
 
     // ---------------------------------- M5: output-kind resolution -------------------------------

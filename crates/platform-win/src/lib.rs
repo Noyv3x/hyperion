@@ -7,6 +7,8 @@
 //!   `Drop` ([`TimerResGuard`]).
 //! * [`sched`] — apply the hot-thread MMCSS / affinity / priority policy, reverted on `Drop`
 //!   ([`HotPolicyGuard`]).
+//! * [`topology`] — query the processor topology to auto-select a physical core for the hot thread
+//!   that avoids logical CPU 0's SMT sibling ([`topology::auto_select_core`]).
 //! * [`priority`] — process priority class (`HIGH_PRIORITY_CLASS`, never `REALTIME`).
 //! * [`hidhide`] — hide the physical pad from everything but us via HidHide IOCTLs (CLI fallback).
 //! * [`foreground`] — snapshot the foreground window's process basename + title for the
@@ -24,9 +26,11 @@ pub mod hidhide;
 pub mod priority;
 pub mod sched;
 pub mod timerres;
+pub mod topology;
 
 pub use foreground::{foreground_app, ForegroundApp};
 pub use hidhide::HidHide;
 pub use priority::{set_high_priority_class, PriorityClassGuard};
 pub use sched::{apply_hot_thread_policy, HotPolicyGuard, HotThreadConfig};
 pub use timerres::{begin_timer_resolution, TimerResGuard};
+pub use topology::auto_select_core;

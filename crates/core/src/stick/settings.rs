@@ -422,9 +422,11 @@ pub struct StickState {
     pub snap_hist: SnapbackRing,
     /// Flick: whether a flick is in progress (M5 consumer).
     pub flick_in_progress: bool,
-    /// Flick: remaining angle of the in-progress flick (radians, M5 consumer).
-    pub flick_angle_remaining: f64,
-    /// Flick: last stick angle (radians, M5 consumer).
+    /// Flick: last stick angle (radians); the anchor the per-report relative turn differences
+    /// against. Flick is **single-sweep** in v1 — stage 9 emits the per-report angular delta
+    /// (`flick_delta`) directly, so there is no separate in-progress remaining-angle accumulator
+    /// (the dead `flick_angle_remaining` field was removed in M7). A whole-flick remaining-angle
+    /// model (snap a fixed sweep over N reports) is a future, additive change if HW tuning wants it.
     pub flick_last_angle: f64,
     /// OUT: per-report relative turn for the mouse path (M5 consumer; written by stage 9).
     pub flick_delta: f64,
@@ -444,7 +446,6 @@ impl StickState {
         self.fuzz_last = [0.0, 0.0];
         self.snap_hist.clear();
         self.flick_in_progress = false;
-        self.flick_angle_remaining = 0.0;
         self.flick_last_angle = 0.0;
         self.flick_delta = 0.0;
     }

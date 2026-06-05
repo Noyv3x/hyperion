@@ -110,11 +110,13 @@ pub fn apply_hot_thread_policy(cfg: &HotThreadConfig) -> HotPolicyGuard {
         mmcss_active: false,
     };
 
-    // --- Affinity: pin to the configured logical core. ---
-    if let Some(core) = cfg.hot_core {
-        // HW-verify: SMT-sibling avoidance / physical-core auto-detect (when `hot_core` is `None`)
-        // is left to the caller's topology layer; here we honour an explicit pin only. A mask must
-        // fit the affinity word (64 logical CPUs on 64-bit); ignore out-of-range requests.
+    // --- Affinity: pin to the configured logical core, else auto-select a physical core. ---
+    // `Some(n)` honours an explicit pin exactly as before. `None` asks the topology layer for a
+    // physical core whose SMT sibling is free (avoiding logical CPU 0 / the GUI core); if that query
+    // yields nothing we leave the thread unpinned — the pre-M7 behaviour for the `None` case.
+    let core = cfg.hot_core.or_else(crate::topology::auto_select_core);
+    if let Some(core) = core {
+        // A mask must fit the affinity word (64 logical CPUs on 64-bit); ignore out-of-range cores.
         if core < usize::BITS as usize {
             let mask: usize = 1usize << core;
             // SAFETY: valid thread pseudo-handle; `mask` is a non-zero affinity mask. Returns the

@@ -103,4 +103,37 @@ mod tests {
         assert_eq!(f.to_axis(-32768), -1.0);
         assert_eq!(f.to_axis(32767), 1.0);
     }
+
+    #[test]
+    fn xinput_16_matches_const() {
+        assert_eq!(RawStickFormat::xinput(16), RawStickFormat::XINPUT_16);
+    }
+
+    #[test]
+    fn xinput_adjustable_depth_has_exact_endpoints() {
+        for bits in [8u8, 12, 14, 16] {
+            let f = RawStickFormat::xinput(bits);
+            assert_eq!(f.to_axis(f.neutral), 0.0);
+            assert_eq!(f.to_axis(f.min), -1.0);
+            assert_eq!(f.to_axis(f.max), 1.0);
+        }
+    }
+
+    #[test]
+    fn out_of_range_inputs_are_clamped() {
+        let f = RawStickFormat::DS_8BIT;
+        assert_eq!(f.to_axis(-1000), -1.0);
+        assert_eq!(f.to_axis(1000), 1.0);
+        assert_eq!(f.from_axis(5.0), 255);
+        assert_eq!(f.from_axis(-5.0), 0);
+    }
+
+    #[test]
+    fn raw_roundtrip_is_lossless() {
+        for f in [RawStickFormat::DS_8BIT, RawStickFormat::XINPUT_16] {
+            for raw in (f.min..=f.max).step_by(7).chain([f.min, f.neutral, f.max]) {
+                assert_eq!(f.from_axis(f.to_axis(raw)), raw);
+            }
+        }
+    }
 }

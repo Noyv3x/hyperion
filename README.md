@@ -5,7 +5,7 @@ An **ultra-low-latency esports controller engine**, written from scratch in Rust
 Hyperion is a clean-room Rust rewrite of **Hyperion-ds4w** (the author's GPL-3.0
 DS4Windows fork). It intercepts a physical pad (DualSense / DualSense Edge over USB
 first), runs a validated **RC stick filter** in a pure, OS-free numeric core, and
-re-emits a virtual Xbox 360 pad via ViGEm — targeting the lowest controllable input
+re-emits a virtual Xbox 360 / DS4 pad via ViGEm (and keyboard/mouse input) — targeting the lowest controllable input
 latency, no unnecessary requantization (full-precision `f64` from de-quantization to
 a single final `i16` write), and the lowest achievable CPU load.
 
@@ -28,10 +28,12 @@ hid-input    [win]   #![cfg(windows)]     I/O-only HID shell: enumerate VID/PID,
                                           ReadFile, hand &[u8] + QPC timestamp to the core parsers.
 vgamepad-output [win] #![cfg(windows)]    VirtualPad trait + Vigem360Pad. Maps the core OutputFrame
                                           to an XUSB report (single final round). One IOCTL.
+kbm-output   [win]   #![cfg(windows)]     Keyboard/mouse injection (batched, edge-deduped
+                                          SendInput) and the timed macro player.
 platform-win   [win] #![cfg(windows)]     HidHide (IOCTL + CLI fallback), timer-resolution RAII,
                                           MMCSS, affinity, process priority class.
 engine               core (always) +      Thread architecture + lock-free handoff. Owns the hot loop,
-                     [win] the 3 above     dt measurement, telemetry, config store, supervisor.
+                     [win] the 4 above     dt measurement, telemetry, config store, supervisor.
                                           Pure parts (clock, seq, handoff, config_store) are Linux-testable.
 app          [win]   bin "hyperion"       Starts the non-blocking engine Runtime, then runs the
                                           LIVE egui tuning GUI + tray on the main thread (M2). The
@@ -40,7 +42,7 @@ app          [win]   bin "hyperion"       Starts the non-blocking engine Runtime
 ```
 
 Dependency direction: `core` depends on nothing OS. `engine` depends on `core`
-unconditionally and on `{hid-input, vgamepad-output, platform-win}` only under
+unconditionally and on `{hid-input, vgamepad-output, kbm-output, platform-win}` only under
 `[target.'cfg(windows)'.dependencies]`. `app` depends on `engine`. This keeps the
 core (and the engine's pure modules) building and testing on Linux with no Windows
 toolchain.
@@ -64,17 +66,25 @@ Everything Windows-specific is `#![cfg(windows)]` and is built, tested, and lint
 Real-hardware bring-up (HID open through HidHide, ViGEm enumeration, latency under
 MMCSS/affinity) happens off-CI on the author's box.
 
-## M1 status
+## Status
 
-M1 is an **end-to-end vertical slice**: DualSense USB → core RC `UltimateDt` →
-virtual Xbox 360. The numeric core is implemented and tested (FireBird goldens,
-`dt == periodUs` reduction, rate-invariance, conversion, input parse, config
-round-trip); the Windows I/O crates are compiling skeletons being filled in.
-There are **no `windows` / ViGEm / egui dependencies in M1** — the platform crates
-are dependency-free `cfg(windows)` skeletons so the workspace builds cleanly while
-the slice comes together.
+Hyperion is a DS4Windows-class remapper on top of the RC filter. Milestones M1–M7 are
+implemented (see [`DESIGN-REMAP.md`](DESIGN-REMAP.md) §12 for the remapper roadmap):
 
-## M2 status
+| Milestone | Scope |
+|---|---|
+| M1 | End-to-end slice: DualSense USB → RC `UltimateDt` → virtual Xbox 360 |
+| M2 | Live egui tuning GUI, dynamic curve editor, telemetry |
+| M3 | Remapper spine: structured state, full stick/trigger pipeline, mapping engine, KBM output |
+| M4 | Shift layers, turbo, macros, mouse-from-stick, mouse buttons/wheel, special actions |
+| M5 | Multi-profile, auto-switch by foreground game, DS4 output, gyro→mouse, flick stick |
+| M6 | Touchpad decode, touch regions, touchpad-mouse, two-stage triggers, Edge bits, import/export |
+| M7 | Wired the remaining inert features end-to-end (touch/Edge flow, macros, special actions) |
+
+Still hardware-gated (see the "Remaining" sections of the design docs): DSE timestamp
+calibration, touchpad/gyro constants, Edge Fn/paddle/Mute bits, DS4 Y polarity.
+
+### GUI (M2)
 
 M2 adds the **live egui tuning GUI** (Windows). `app` now starts the non-blocking
 [`engine::Runtime`], hands the GUI a telemetry reader + a `ControlMsg` sender + a seed
